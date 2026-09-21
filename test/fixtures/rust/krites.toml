@@ -1,0 +1,8 @@
+version = 1
+
+[checks]
+commands = [
+  "cargo fmt --check",
+  "cargo test",
+]
+timeout_seconds = 300

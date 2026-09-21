@@ -1,0 +1,7 @@
+version = 1
+
+[checks]
+commands = [
+  "npm run typecheck",
+]
+timeout_seconds = 300

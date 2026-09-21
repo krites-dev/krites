@@ -1,0 +1,11 @@
+[workspace]
+
+[workspace.package]
+license = "Apache-2.0"
+
+[package]
+name = "krites-fixture"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false

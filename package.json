@@ -1,0 +1,18 @@
+{
+  "name": "krites-plugin",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Requires Node 20 or later. Protects judge files from the edit tools and gates the stop on the repo's own checks.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "lint": "eslint .",
+    "test": "node --test test/bypass.test.js test/cli-receipt.test.js test/commands.test.js test/config.test.js test/deadline.test.js test/e2e.test.js test/fabricated.test.js test/gate.test.js test/glob.test.js test/inert.test.js test/init.test.js test/output.test.js test/ping.test.js test/protect.test.js test/receipt.test.js test/session.test.js test/state.test.js test/timeouts.test.js test/verify.test.js"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.10.0"
+  }
+}
