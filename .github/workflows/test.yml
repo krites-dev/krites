@@ -1,0 +1,52 @@
+name: test
+
+# This file is mirrored into krites-dev/krites, where it runs at the repo root; the monorepo's own ci.yml runs the gate.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  plugin:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        node: [20, 22]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+      # The end-to-end fixtures build in a copy under the temp dir, which no rust-toolchain.toml reaches, so the
+      # default toolchain runs them and needs rustfmt of its own.
+      - run: rustup toolchain install stable --profile minimal --component rustfmt
+      - run: npm ci --prefix test/fixtures/ts
+      - run: npm test
+      - run: npm test
+        env:
+          KRITES_TEST_NONASCII: "1"
+
+  flaky-watch:
+    if: github.event_name == 'push'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      # One test failed once in 34 local runs on Windows with no assertion captured; 200 runs per push keep watching it.
+      - shell: bash
+        run: |
+          name='gate: a block with no owner is never charged to a root that passed in the same run'
+          for i in $(seq 1 200); do
+            if [ $((i % 2)) -eq 0 ]; then export KRITES_TEST_NONASCII=1; else unset KRITES_TEST_NONASCII; fi
+            node --test --test-name-pattern="$name" test/gate.test.js >run.log 2>&1 || { echo "run $i of 200 failed"; cat run.log; exit 1; }
+            grep -Fq "$name" run.log || { echo "run $i never ran the test; was it renamed?"; cat run.log; exit 1; }
+          done
+          echo "200 of 200 passed"
