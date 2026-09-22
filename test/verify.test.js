@@ -360,10 +360,10 @@ test("verify: a config error and a tree git cannot read are reported, and no che
   assert.strictEqual(fs.existsSync(marker), false);
 });
 
-test("verify: telemetry answers in one line until an endpoint exists", async () => {
+test("verify: telemetry answers in one line while the endpoint is off", async () => {
   const repo = repoWith([script("process.exit(0)")]);
   for (const args of [["telemetry"], ["telemetry", "on"], ["telemetry", "off"]]) {
     const lines = printed(await runCli(args, { cwd: repo }));
-    assert.deepStrictEqual(lines, ["Telemetry is not available in this build: no endpoint is configured."], args.join(" "));
+    assert.deepStrictEqual(lines, ["Telemetry is switched off: KRITES_PING_ENDPOINT is set to off, so nothing is asked and nothing is sent."], args.join(" "));
   }
 });

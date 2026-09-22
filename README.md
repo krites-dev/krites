@@ -14,13 +14,13 @@ Krites runs your coding agent's work through checks the agent cannot touch and w
 - `/krites:init` shows the `krites.toml` it would write for this repo and the Node version it found. `/krites:init --write` creates it, or approves a `krites.toml` you edited yourself.
 - `/krites:verify` runs the configured checks now and prints their raw output, nothing else. Its command file and `/krites:init`'s ask Claude to show the output as one code block, because Claude Code renders a reply as markdown and a glob's `**` or a line starting with `>` would otherwise not look like what was printed.
 - `/krites:receipt` writes the last run as a signed JSON file and a Markdown rendering under `receipts/`.
-- `/krites:telemetry on|off` answers the anonymous ping question (see Telemetry).
+- `/krites:telemetry on|off` answers the weekly ping question (see Telemetry).
 
 Commit `krites.toml`. Until a repo has one, the plugin checks nothing there and says so once at session start.
 
 ## What it does
 
-- Denies the edit tools on the paths in `[protect]`, on `krites.toml`, `.krites/` and `.git/`, and on anything outside the repo.
+- Denies the edit tools on the paths in `[protect]`, on `krites.toml`, `.krites/` and `.git/`, and on anything outside the repo except this project's Claude Code memory folder in its default place, the `memory/` beside the session transcript Claude Code names in every hook call, so Claude can still save memory there. A memory folder that is a link, or that lives inside a repo, gets no exception.
 - Runs `[checks].commands` in order when the agent tries to stop and blocks the stop on the first failure, with the command and the last 60 lines of its output as the reason.
 - Exports a signed receipt of the last run.
 
@@ -92,4 +92,4 @@ node verify-receipt.js --key <fingerprint> <receipt.json>
 
 Apache-2.0.
 
-Telemetry is off until you are asked and say yes. This build ships with no endpoint, which switches it off altogether: nothing is asked and nothing is sent. When an endpoint exists (built in, or set in the `KRITES_PING_ENDPOINT` environment variable, which wins over the built-in one), `/krites:init`, `/krites:verify` and `/krites:receipt` end with the question until you answer it: may Krites send an anonymous ping, now and once a week, `{ "install_id": "<random uuid>", "version": "<plugin version>", "os": "win32|darwin|linux", "ts": "<time>" }`, and nothing else. After a yes, the ping leaves at most once a week, from the first allowed stop or Krites command of that week, in whichever repo that happens, with or without a `krites.toml`. It never leaves from a blocked or timed-out stop and never changes a verdict. `/krites:telemetry off` is permanent until you run `/krites:telemetry on`. The answer is stored next to the signing key, never in a repo.
+Telemetry is off until you are asked and say yes. `/krites:init`, `/krites:verify` and `/krites:receipt` end with the question until you answer it: may Krites send a ping to krites.dev, now and once a week, `{ "install_id": "<random uuid>", "version": "<plugin version>", "os": "win32|darwin|linux", "ts": "<time>" }`, and nothing else. The install id is random but stays the same from one ping to the next, so the ping is pseudonymous, not anonymous. Pings go to https://krites.dev/ping, a Cloudflare Worker run by Krites, which stores the install id, version, OS and timestamp and the day the ping was received, and does not store your IP address or any request header. Pings are kept for 12 months. The `KRITES_PING_ENDPOINT` environment variable wins over the built-in endpoint, and `KRITES_PING_ENDPOINT=off` (any case) switches telemetry off altogether; an empty value uses the built-in endpoint: nothing is asked and nothing is sent. After a yes, the ping leaves at most once a week, from the first allowed stop or Krites command of that week, in whichever repo that happens, with or without a `krites.toml`. It never leaves from a blocked or timed-out stop and never changes a verdict. `/krites:telemetry off` is permanent until you run `/krites:telemetry on`. The answer is stored next to the signing key, never in a repo.

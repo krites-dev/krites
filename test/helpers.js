@@ -16,10 +16,10 @@ const nonAscii = process.env.KRITES_TEST_NONASCII === "1";
 const parent = nonAscii ? fs.mkdtempSync(path.join(os.tmpdir(), "krites tëst Проверка ")) : os.tmpdir();
 const tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(parent, "krites-plugin-")));
 
-// gate() and main() also run inside the test processes, where childEnvFor guards nothing: without this a developer
-// with an endpoint exported and consent given would have a test run post, and rewrite their own telemetry.json.
+// gate() and main() also run inside the test processes, where childEnvFor guards nothing. Unset, the endpoint
+// would be the built-in krites.dev one, so it is switched off here and a test that needs one passes its own.
 process.env.KRITES_CONFIG_DIR = path.join(tmp, "own-config");
-delete process.env.KRITES_PING_ENDPOINT;
+process.env.KRITES_PING_ENDPOINT = "off";
 
 const junctions = [];
 // Leftover processes are not killed here: by the end of a file a recorded pid may belong to something else,
@@ -162,17 +162,19 @@ function assertBlock(result, pattern) {
   return out.reason;
 }
 
-// The day the endpoint constant is set, an inherited one would ping and write the developer's own telemetry.json.
+// A child left to the built-in endpoint would ping krites.dev and write the developer's own telemetry.json.
 function childEnvFor(env) {
   const childEnv = { ...process.env };
   delete childEnv.CLAUDE_PROJECT_DIR;
   delete childEnv.CLAUDE_PLUGIN_ROOT;
-  delete childEnv.KRITES_PING_ENDPOINT;
+  childEnv.KRITES_PING_ENDPOINT = "off";
   if (!String(childEnv.KRITES_CONFIG_DIR).startsWith(tmp)) childEnv.KRITES_CONFIG_DIR = path.join(tmp, "child-config");
   for (const [name, value] of Object.entries(env)) {
     if (value === undefined) delete childEnv[name];
     else childEnv[name] = value;
   }
+  // An override of undefined or "" would fall back to the built-in endpoint.
+  if (!childEnv.KRITES_PING_ENDPOINT) childEnv.KRITES_PING_ENDPOINT = "off";
   return childEnv;
 }
 

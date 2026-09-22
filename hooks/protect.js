@@ -29,7 +29,27 @@ function realTarget(file) {
   return lexists(existing) ? path.join(fs.realpathSync.native(existing), ...missing) : path.resolve(file);
 }
 
-function reasonFor(file, roots, configs) {
+// Claude Code keeps this project's memory beside the session transcript it names in every payload, outside the repo.
+// The project folder is resolved and `memory` is not, so a memory folder that is a link resolves elsewhere and stays denied.
+function memoryDirOf(payload) {
+  const transcript = payload.transcript_path;
+  if (typeof transcript !== "string" || transcript.includes("\0") || !path.isAbsolute(transcript) || !transcript.endsWith(".jsonl")) {
+    return null;
+  }
+  if (UNC.test(transcript)) return null;
+  try {
+    return path.join(realTarget(path.dirname(transcript)), "memory");
+  } catch {
+    return null;
+  }
+}
+
+function inside(dir, target) {
+  const rel = path.relative(dir, target).replace(/\\/g, "/");
+  return rel !== "" && rel !== ".." && !rel.startsWith("../") && !path.isAbsolute(rel);
+}
+
+function reasonFor(file, roots, configs, memoryOf) {
   if (typeof file !== "string" || file.includes("\0")) return "Blocked: the edit path is not a plain string.";
   // Either separator: on POSIX a backslash path is one long file name, and the reason must not echo it whole.
   const name = file.split(/[\\/]/).filter(Boolean).pop() || "the path";
@@ -45,7 +65,11 @@ function reasonFor(file, roots, configs) {
     if (rel === "" || rel === ".." || rel.startsWith("../") || path.isAbsolute(rel)) continue;
     if (!best || entry.root.length > best.entry.root.length) best = { entry, rel };
   }
-  if (!best) return outside;
+  if (!best) {
+    const memory = memoryOf();
+    const allowed = memory && inside(memory, target) && !(WINDOWS && path.relative(memory, target).includes(":"));
+    return allowed ? null : outside;
+  }
   if (WINDOWS && best.rel.includes(":")) return `Blocked: ${name} names an alternate data stream.`;
 
   // Win32 drops trailing dots and spaces from each component, so "tests./krites" lands in "tests/krites".
@@ -72,9 +96,11 @@ function decide(payload, roots) {
   if (input === undefined) return null;
   if (input === null || typeof input !== "object" || Array.isArray(input)) return "Blocked: the tool input is not an object.";
   try {
+    let memory;
+    const memoryOf = () => (memory === undefined ? (memory = memoryDirOf(payload)) : memory);
     for (const key of PATH_KEYS) {
       if (input[key] === undefined || input[key] === null || input[key] === "") continue;
-      const reason = reasonFor(input[key], roots, configs);
+      const reason = reasonFor(input[key], roots, configs, memoryOf);
       if (reason) return reason;
     }
     return null;

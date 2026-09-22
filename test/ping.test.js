@@ -99,13 +99,13 @@ function repoWith(source, extra = {}) {
   return repo;
 }
 
-test("ping: nothing is sent before consent, and the question comes only once an endpoint exists", async () => {
+test("ping: nothing is sent before consent, and the question comes only while an endpoint is on", async () => {
   freshConfig();
   const sink = await listen();
   const repo = repoWith("console.log('ok')");
 
   const quiet = await runCli(["verify"], { cwd: repo });
-  assert.ok(!quiet.stdout.includes(ping.QUESTION), "an empty endpoint asks nothing");
+  assert.ok(!quiet.stdout.includes(ping.QUESTION), "an endpoint that is off asks nothing");
 
   for (const args of [["verify"], ["init"], ["receipt"]]) {
     const result = await runCli(args, { cwd: repo, env: { KRITES_PING_ENDPOINT: sink.url } });
@@ -234,7 +234,7 @@ test("ping: a run that has used up its budget does not ping", async () => {
   }
 });
 
-test("ping: a test process that loads the helpers has no endpoint and keeps its state under the temp directory", async () => {
+test("ping: a test process that loads the helpers has the endpoint off and keeps its state under the temp directory", async () => {
   // gate() and main() also run inside test processes, where childEnvFor guards nothing.
   const outside = path.join(os.tmpdir(), `krites-developer-config-${process.pid}`);
   const show = script(
@@ -244,7 +244,7 @@ test("ping: a test process that loads the helpers has no endpoint and keeps its 
   const developer = { KRITES_PING_ENDPOINT: "http://127.0.0.1:9/", KRITES_CONFIG_DIR: outside };
   const out = (await runHook(show, null, { cwd: tmp, env: developer })).stdout;
   const line = out.split("\n").find((text) => text.startsWith("ENV:"));
-  assert.deepStrictEqual(JSON.parse(line.slice(4)), [null, true], line);
+  assert.deepStrictEqual(JSON.parse(line.slice(4)), ["off", true], line);
 });
 
 test("ping: a spawned child sees neither the parent's endpoint nor its config directory", async () => {
@@ -259,8 +259,8 @@ test("ping: a spawned child sees neither the parent's endpoint nor its config di
   try {
     const repo = repoWith("console.log('ok')");
     await runHook(GATE, stop(repo), { cwd: repo });
-    assert.deepStrictEqual(JSON.parse((await runHook(show, null, { cwd: tmp })).stdout), [null, child], "a hook gets neither");
-    assert.match((await runCli(["telemetry"], { cwd: repo })).stdout, /no endpoint is configured/, "and neither does a command");
+    assert.deepStrictEqual(JSON.parse((await runHook(show, null, { cwd: tmp })).stdout), ["off", child], "a hook gets neither");
+    assert.match((await runCli(["telemetry"], { cwd: repo })).stdout, /KRITES_PING_ENDPOINT is set to off/, "and neither does a command");
 
     const made = await runCli(["receipt"], { cwd: repo });
     assert.strictEqual(made.code, 0, made.stdout);
@@ -311,7 +311,7 @@ test("ping: a timed-out run never pings, not even when the budget lets the stop 
   assert.strictEqual(stored().last_attempt_at, null);
 });
 
-test("ping: with no endpoint nothing is written and nothing is sent", async () => {
+test("ping: with the endpoint off nothing is written and nothing is sent", async () => {
   const dir = freshConfig();
   const repo = repoWith("console.log('ok')");
 
@@ -321,7 +321,18 @@ test("ping: with no endpoint nothing is written and nothing is sent", async () =
     assert.strictEqual(result.stderr, "", args.join(" "));
   }
   assert.deepStrictEqual(await runHook(GATE, stop(repo), { cwd: repo }), SILENT);
-  assert.strictEqual(fs.existsSync(path.join(dir, FILE)), false, "an empty endpoint is off altogether");
+  assert.strictEqual(fs.existsSync(path.join(dir, FILE)), false, "an endpoint that is off is off altogether");
+});
+
+test("ping: the suite never resolves to the built-in endpoint, in the test process or in a child", async () => {
+  assert.strictEqual(ping.ENDPOINT, "https://krites.dev/ping");
+  assert.strictEqual(ping.endpointOf(), "", "the test process has the endpoint off");
+  const show = script(`console.log(JSON.stringify(require(${JSON.stringify(path.join(__dirname, "..", "lib", "ping.js"))}).endpointOf()));`)[1];
+  assert.strictEqual(JSON.parse((await runHook(show, null, { cwd: tmp })).stdout), "", "and so does a child spawned with no override");
+  for (const empty of [undefined, ""]) {
+    const env = { KRITES_PING_ENDPOINT: empty };
+    assert.strictEqual(JSON.parse((await runHook(show, null, { cwd: tmp, env })).stdout), "", `and one whose override is ${JSON.stringify(empty)}`);
+  }
 });
 
 test("ping: nothing was written under the real user config directory", () => {

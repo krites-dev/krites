@@ -151,6 +151,72 @@ test("protect: paths outside the repo are denied", () => {
   assert.strictEqual(decide(input(path.join(linked, "src", "lib.rs")), roots), null);
 });
 
+test("protect: this project's Claude Code memory folder stays writable, and nothing else outside the repo does", () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  const projects = path.join(fs.mkdtempSync(path.join(tmp, "claude-home-")), ".claude", "projects");
+  const project = path.join(projects, "D--work-repo");
+  const other = path.join(projects, "D--other-repo");
+  fs.mkdirSync(path.join(project, "memory"), { recursive: true });
+  fs.mkdirSync(path.join(other, "memory"), { recursive: true });
+  const transcript = path.join(project, "3f2b8c1e-9a4d-4e7b-8c21-5d6f7a8b9c0d.jsonl");
+  fs.writeFileSync(transcript, "");
+  const write = (file, transcriptPath = transcript) => ({ transcript_path: transcriptPath, tool_input: { file_path: file } });
+
+  assert.strictEqual(decide(write(path.join(project, "memory", "note.md")), roots), null);
+  assert.strictEqual(decide(write(path.join(project, "memory", "MEMORY.md")), roots), null);
+  assert.strictEqual(decide(write(path.join(project, "memory", "sub", "deep.md")), roots), null);
+
+  for (const denied of [
+    path.join(project, "other.md"),
+    transcript,
+    path.join(project, "memory"),
+    `${path.join(project, "memory")}${path.sep}..${path.sep}escaped.md`,
+    path.join(other, "memory", "note.md"),
+    path.join(projects, "..", "settings.json"),
+  ]) {
+    assert.match(decide(write(denied), roots), /outside the repository/, denied);
+  }
+  const note = { file_path: path.join(project, "memory", "note.md") };
+  assert.match(decide({ tool_input: note }, roots), /outside the repository/, "no transcript_path");
+  for (const bad of [null, 42, "relative/session.jsonl", path.join(project, "notes.txt")]) {
+    assert.match(decide({ transcript_path: bad, tool_input: note }, roots), /outside the repository/, String(bad));
+  }
+
+  const away = path.join(tmp, `memory-escape-${process.pid}`);
+  fs.mkdirSync(away, { recursive: true });
+  fs.symlinkSync(away, path.join(project, "memory", "escape"), "junction");
+  assert.match(decide(write(path.join(project, "memory", "escape", "x.md")), roots), /outside the repository/);
+});
+
+test("protect: a memory folder that is itself a link, or sits inside a repo, gains nothing", () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  const project = path.join(fs.mkdtempSync(path.join(tmp, "claude-home-")), ".claude", "projects", "D--work-repo");
+  const away = path.join(tmp, `memory-target-${process.pid}-${Date.now()}`);
+  fs.mkdirSync(project, { recursive: true });
+  fs.mkdirSync(away, { recursive: true });
+  fs.symlinkSync(away, path.join(project, "memory"), "junction");
+  const transcript = path.join(project, "3f2b8c1e-9a4d-4e7b-8c21-5d6f7a8b9c0d.jsonl");
+  assert.match(decide({ transcript_path: transcript, tool_input: { file_path: path.join(project, "memory", "x.md") } }, roots), /outside the repository/);
+
+  const inRepo = path.join(repo, "tests", "krites");
+  fs.mkdirSync(path.join(inRepo, "memory"), { recursive: true });
+  const inRepoTranscript = path.join(inRepo, "3f2b8c1e-9a4d-4e7b-8c21-5d6f7a8b9c0d.jsonl");
+  assert.match(decide({ transcript_path: inRepoTranscript, tool_input: { file_path: path.join(inRepo, "memory", "x.md") } }, roots), /is protected/);
+});
+
+test("protect: a memory folder that cannot be resolved never blocks edits inside the repo", () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  const project = path.join(fs.mkdtempSync(path.join(tmp, "claude-home-")), ".claude", "projects", "D--work-repo");
+  fs.mkdirSync(project, { recursive: true });
+  fs.symlinkSync(path.join(tmp, `gone-${process.pid}-${Date.now()}`), path.join(project, "memory"), "junction");
+  const payload = (file) => ({ transcript_path: path.join(project, "s.jsonl"), tool_input: { file_path: file } });
+  assert.strictEqual(decide(payload(path.join(repo, "src", "lib.rs")), roots), null);
+  assert.match(decide(payload(path.join(project, "memory", "x.md")), roots), /outside the repository|could not be resolved/);
+});
+
 test("protect: the deepest root decides which globs apply", () => {
   const repo = makeRepo({
     files: { "krites.toml": 'version = 1\n\n[protect]\nglobs = ["**/secret.txt"]\n', "inner/krites.toml": 'version = 1\n\n[protect]\nglobs = ["own.txt"]\n' },

@@ -183,9 +183,9 @@ test("output: a command whose stdout is gone still exits 0 with nothing on stder
   seed(repo);
   fs.writeFileSync(path.join(repo, "a.txt"), "changed\n");
 
-  // The helpers' own rules for a spawned child: no project dir, no endpoint, a config dir under the test temp dir.
-  const env = { ...process.env, KRITES_CONFIG_DIR: path.join(tmp, "output-config") };
-  for (const name of ["CLAUDE_PROJECT_DIR", "CLAUDE_PLUGIN_ROOT", "KRITES_PING_ENDPOINT"]) delete env[name];
+  // The helpers' own rules for a spawned child: no project dir, the endpoint off, a config dir under the test temp dir.
+  const env = { ...process.env, KRITES_CONFIG_DIR: path.join(tmp, "output-config"), KRITES_PING_ENDPOINT: "off" };
+  for (const name of ["CLAUDE_PROJECT_DIR", "CLAUDE_PLUGIN_ROOT"]) delete env[name];
 
   for (const args of [["verify"], ["init"]]) {
     const child = spawn(process.execPath, [path.join(__dirname, "..", "cli.js"), ...args], { cwd: repo, env, windowsHide: true });

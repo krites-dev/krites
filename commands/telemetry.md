@@ -1,5 +1,5 @@
 ---
-description: Turn the anonymous Krites ping on or off.
+description: Turn the weekly Krites ping on or off.
 allowed-tools: Bash(node "${CLAUDE_PLUGIN_ROOT}/cli.js":*)
 argument-hint: on|off
 disable-model-invocation: true
