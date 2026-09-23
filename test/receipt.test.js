@@ -352,9 +352,12 @@ test("receipt: a run signed right after the gate verifies, and a second export i
   const repo = await ran({ commands: [script("console.log('fine')")] });
   const built = receipts.build(repo);
   assert.strictEqual(built.ok, true, built.reason);
-  assert.strictEqual(built.receipt.schema, "krites.receipt/0.1");
+  const run = JSON.parse(fs.readFileSync(path.join(repo, LAST_RUN), "utf8"));
+  assert.strictEqual(built.receipt.schema, "krites.receipt/0.2");
   assert.strictEqual(built.receipt.verdict, "passed");
-  assert.strictEqual(built.receipt.created_at, JSON.parse(fs.readFileSync(path.join(repo, ".krites", "last-run.json"), "utf8")).created_at);
+  assert.strictEqual(built.receipt.created_at, run.created_at);
+  assert.strictEqual(built.receipt.tree_fingerprint, run.fingerprint, "the tree state the gate recorded");
+  assert.strictEqual("fingerprint" in built.receipt, false, "no field a reader could pass to --key");
 
   const where = receipts.write(repo, built.receipt, DIR);
   const json = fs.readFileSync(path.join(repo, where.json));
@@ -465,6 +468,16 @@ test("receipt: the verifier prints one line with exit 0 or 1, and --key pins the
     assert.match(lines[0], line);
     assert.doesNotMatch(lines[0], ABSOLUTE, "no absolute path in the verifier's output");
   }
+});
+
+test("receipt: a krites.receipt/0.1 receipt still verifies, pinned to the key that signed it", () => {
+  const file = path.join(__dirname, "fixtures", "receipt-0.1.json");
+  const old = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.strictEqual(old.schema, "krites.receipt/0.1");
+  assert.ok("fingerprint" in old && !("tree_fingerprint" in old), "the 0.1 shape");
+  const result = runVerifier(["--key", "6b11164d362ea9b5", file]);
+  assert.strictEqual(result.status, 0, result.stdout);
+  assert.strictEqual(result.stdout, "valid: signed by 6b11164d362ea9b5c7711d8f5465d76c7d6da068a55f9b4253bd697171978bfa, verdict passed\n");
 });
 
 test("receipt: nothing was written under the real user config directory", () => {

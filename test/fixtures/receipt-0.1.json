@@ -1,0 +1,53 @@
+{
+  "checks": [
+    {
+      "command": "cargo fmt --check",
+      "duration_ms": 162,
+      "exit_code": 0,
+      "tail": ""
+    },
+    {
+      "command": "cargo test",
+      "duration_ms": 536,
+      "exit_code": 0,
+      "tail": "   Compiling krites-fixture v0.1.0 (.)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.30s\n     Running unittests src\\lib.rs (target\\debug\\deps\\krites_fixture-b47e9f1eb22c7040.exe)\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n     Running tests\\total.rs (target\\debug\\deps\\total-ab1a7d6bba047f68.exe)\n\nrunning 1 test\ntest total_sums_the_values ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n   Doc-tests krites_fixture\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n"
+    }
+  ],
+  "commands": [
+    [
+      "cargo",
+      "fmt",
+      "--check"
+    ],
+    [
+      "cargo",
+      "test"
+    ]
+  ],
+  "config_hash": "a886c46fc87596954156251643cf52d997ed033690c4cfb25c46612b634d15e5",
+  "created_at": "2026-09-21T15:49:43Z",
+  "diff": {
+    "deletions": 1,
+    "files": [
+      "src/lib.rs"
+    ],
+    "files_changed": 1,
+    "insertions": 1
+  },
+  "fingerprint": "d10e3ed5362a034fabb932db8dd710d3fab41648d67ada74bedc37d497387754",
+  "plugin_version": "0.1.0",
+  "reason": null,
+  "repo": {
+    "dirty": true,
+    "head": "6d50a7a6911a3718a704e0243acb3e0f5ae7a122",
+    "root_hash": "d50d438f2b5f23e378230279f0c65b317d554b8e43f365334e1a5a89460566af"
+  },
+  "schema": "krites.receipt/0.1",
+  "session_id": "v0-sample",
+  "signature": {
+    "alg": "ed25519",
+    "public_key": "S8B0by11nSvB+iMlF9ElY2jp7eOuRP8Afkz4CM7kiz8=",
+    "sig": "Fu9mEWmxCWcGuSTUB5YrpDEJ9Wsmy7CxSqbq2HlPZofOYvW1/EyVYS68LBEdycRIzLa2t746lRM4CUYD48KCCg=="
+  },
+  "verdict": "passed"
+}
