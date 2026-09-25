@@ -3,6 +3,7 @@ const { DEFAULT_MAX_BLOCKS, findRoots, loadConfig, protectedGlobs } = require(".
 const { matches } = require("../lib/glob.js");
 const hookio = require("../lib/hookio.js");
 const ping = require("../lib/ping.js");
+const { wellFormed } = require("../lib/receipt.js");
 const { scrub } = require("../lib/scrub.js");
 const state = require("../lib/state.js");
 
@@ -96,7 +97,7 @@ function treeState(root) {
 
 // The whole judgement, shared with /krites:verify: the bypass check, the checks between two fingerprints, and the reason.
 // `failed` is a clause the caller words for its own event; every other field is what the caller records.
-async function judge(root, loaded, { baseline, deadline }) {
+async function judge(root, loaded, { baseline, deadline, commands = loaded.config.checks.commands }) {
   const config = loaded.config;
   // The directory and its .gitignore land before the first fingerprint, so the gate's own writes never change it.
   state.ensureDir(root);
@@ -111,7 +112,7 @@ async function judge(root, loaded, { baseline, deadline }) {
   const candidates = record === null ? changed : changed.filter((rel) => rel !== "krites.toml");
   const touched = configChanged ? "krites.toml" : candidates.find((rel) => globs.some((glob) => matches(glob, rel)));
   const deadlineMs = deadline();
-  const run = touched ? { verdict: "refuted", checks: [], failed: null } : await runChecks({ commands: config.checks.commands, root, deadlineMs });
+  const run = touched ? { verdict: "refuted", checks: [], failed: null } : await runChecks({ commands, env: config.checks.env, root, deadlineMs });
 
   if (state.fingerprint(root) !== before) return { failed: "the tree changed while the gate ran, so the checks say nothing" };
   const reason =
@@ -125,6 +126,17 @@ async function judge(root, loaded, { baseline, deadline }) {
   return { run, reason, touched, deadlineMs, before, record };
 }
 
+// Only a whole, clean pass is carried: a carried failure would contradict the stop's own passed verdict.
+function carriedSlow(root, loaded, judged) {
+  const { commands, slow } = loaded.config.checks;
+  if (judged.run.verdict !== "passed" || judged.run.checks.length !== commands.length || slow.length === 0) return [];
+  const previous = state.readLastRun(root);
+  if (!previous || previous.verdict !== "passed" || previous.fingerprint !== judged.before || previous.config_hash !== loaded.hash) return [];
+  const checks = previous.checks;
+  if (!Array.isArray(checks) || checks.length !== commands.length + slow.length) return [];
+  return checks.every((check) => wellFormed(check) && check.exit_code === 0) ? checks.slice(commands.length) : [];
+}
+
 function recordRun(root, loaded, judged, { head, dirty, baseline, reason, session_id: sessionId }) {
   state.writeLastRun(root, {
     schema: "krites.last-run/0.1",
@@ -136,8 +148,10 @@ function recordRun(root, loaded, judged, { head, dirty, baseline, reason, sessio
     fingerprint: judged.before,
     config_hash: loaded.hash,
     commands: loaded.config.checks.commands,
+    slow: loaded.config.checks.slow,
+    env: Object.entries(loaded.config.checks.env).map(([name, value]) => `${name}=${value}`),
     diff: state.diffStat(root, baseline),
-    checks: judged.run.checks,
+    checks: [...judged.run.checks, ...carriedSlow(root, loaded, judged)],
     verdict: judged.run.verdict,
     reason,
     session_id: sessionId,

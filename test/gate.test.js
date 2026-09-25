@@ -6,7 +6,7 @@ const path = require("node:path");
 const { test } = require("node:test");
 
 const { readBaseline, readBlockCount, readConfigHash, writeBlockCount } = require("../lib/state.js");
-const { ABSOLUTE, assertBlock, configure, git, head, makeDir, makeRepo, runCli, runHook, script, seed, textOf, tmp, toml } = require("./helpers.js");
+const { ABSOLUTE, assertBlock, configure, fromTmp, git, head, makeDir, makeRepo, runCli, runHook, script, seed, textOf, tmp, toml } = require("./helpers.js");
 
 const GATE = path.join(__dirname, "..", "hooks", "gate.js");
 const SILENT = { code: 0, stdout: "", stderr: "" };
@@ -236,9 +236,9 @@ test("gate: a held reason sends no ping, and an allowed stop still does", async 
     sent += 1;
   };
   try {
-    assert.match(await gate(stop(broken), { projectDir: broken }), BROKEN_LINE);
+    assert.match(await fromTmp(() => gate(stop(broken), { projectDir: broken })), BROKEN_LINE);
     assert.strictEqual(sent, 0, "a held reason means the stop is not an allowed one");
-    assert.strictEqual(await gate(stop(fine), { projectDir: fine }), null);
+    assert.strictEqual(await fromTmp(() => gate(stop(fine), { projectDir: fine })), null);
     assert.strictEqual(sent, 1, "an allowed stop still pings");
   } finally {
     ping.send = real;
@@ -420,8 +420,8 @@ test("gate: a check that wipes .krites cannot wipe the attempts already spent", 
 test("gate: a payload that is not an object after a judged one is still charged in the same process", async () => {
   const { gate } = require(GATE);
   const repo = repoWith({ commands: [fail()] });
-  assert.match(await gate(stop(repo), { projectDir: repo }), /refuted/);
-  assert.match(await gate(null, { projectDir: repo }), /not an object/);
+  assert.match(await fromTmp(() => gate(stop(repo), { projectDir: repo })), /refuted/);
+  assert.match(await fromTmp(() => gate(null, { projectDir: repo })), /not an object/);
   assert.strictEqual(readBlockCount(repo), 2, "the second call is its own run");
 });
 
@@ -429,10 +429,10 @@ test("gate: called again in one process it counts like a fresh hook process", as
   const { gate } = require(GATE);
   const repo = repoWith({ commands: [fail()] });
   for (let attempt = 1; attempt <= 3; attempt += 1) {
-    assert.match(await gate(stop(repo), { projectDir: repo }), /refuted/);
+    assert.match(await fromTmp(() => gate(stop(repo), { projectDir: repo })), /refuted/);
     assert.strictEqual(readBlockCount(repo), attempt, "what one call charged does not answer for the next");
   }
-  assert.strictEqual(await gate(stop(repo), { projectDir: repo }), null);
+  assert.strictEqual(await fromTmp(() => gate(stop(repo), { projectDir: repo })), null);
 });
 
 test("gate: input it cannot read, in a place with no root, blocks every time", async () => {
@@ -691,7 +691,7 @@ test("gate: one budget covers both roots, so a later root gets only what is left
   fs.writeFileSync(path.join(outer, "a.txt"), "changed\n");
 
   const started = Date.now();
-  const reason = await gate({ hook_event_name: "Stop", session_id: "s1", cwd: outer }, { totalMs: 6000, startedAt: started, projectDir: inner });
+  const reason = await fromTmp(() => gate({ hook_event_name: "Stop", session_id: "s1", cwd: outer }, { totalMs: 6000, startedAt: started, projectDir: inner }));
   const elapsed = Date.now() - started;
 
   // Its own timeout_seconds is 5; anything under that is budget the first root already spent.
@@ -763,4 +763,111 @@ test("gate: the tail is scrubbed of absolute paths and color codes", async () =>
   assert.doesNotMatch(textOf(run), ABSOLUTE, "no absolute path in last-run.json");
   assert.ok(!textOf(run).includes("sk-abcdefghij"), "no token shape in last-run.json");
   assert.strictEqual(readBaseline(repo), before, "a refuted run never advances the baseline");
+});
+
+test("gate: [checks.env] reaches every check, and the run file records it scrubbed", async () => {
+  const repo = makeRepo({ files: { "a.txt": "a\n" } });
+  const needs = script('process.exit(process.env.GOTOOLCHAIN === "go1.26.6" && process.env.krites_t4_case === "new" ? 0 : 1)');
+  const env = '\n[checks.env]\nGOTOOLCHAIN = "go1.26.6"\nkrites_t4_case = "new"\nAPI_TOKEN = "sk-abcdefghijklmnopqrstuvwxyz0123"\n';
+  const inherited = { KRITES_T4_CASE: "old" };
+
+  configure(repo, toml({ commands: [needs] }));
+  seed(repo);
+  fs.writeFileSync(path.join(repo, "a.txt"), "changed\n");
+  assertBlock(await runHook(GATE, stop(repo), { cwd: repo, env: inherited }), /check\d+\.js/);
+
+  configure(repo, `${toml({ commands: [needs] })}${env}`);
+  seed(repo);
+  fs.writeFileSync(path.join(repo, "a.txt"), "changed again\n");
+  const passed = await runHook(GATE, stop(repo), { cwd: repo, env: inherited });
+  assert.strictEqual(passed.stdout, "", passed.stdout);
+  const run = lastRun(repo);
+  assert.strictEqual(run.verdict, "passed");
+  assert.deepStrictEqual(run.env, ["GOTOOLCHAIN=go1.26.6", "krites_t4_case=new", "API_TOKEN=<redacted>"]);
+  assert.ok(!textOf(run).includes("sk-abcdefghij"), "no token shape in last-run.json");
+
+  const verified = await runCli(["verify"], { cwd: repo, env: inherited });
+  assert.match(verified.stdout, /check\d+\.js\nexit 0\n/, "/krites:verify runs with the same environment");
+  assert.deepStrictEqual(lastRun(repo).env, run.env);
+
+  const receipt = await runCli(["receipt"], { cwd: repo });
+  assert.strictEqual(receipt.code, 0, receipt.stdout);
+  const signed = JSON.parse(fs.readFileSync(path.join(repo, receipt.stdout.split("\n")[0]), "utf8"));
+  assert.strictEqual(signed.schema, "krites.receipt/0.3");
+  assert.deepStrictEqual(signed.env, run.env, "the receipt carries the scrubbed assignments");
+  assert.ok(!JSON.stringify(signed).includes("sk-abcdefghij"));
+});
+
+test("gate: a [checks.env] value under a secret-shaped name is redacted in the run file", async () => {
+  const repo = makeRepo({ files: { "a.txt": "a\n" } });
+  configure(repo, `${toml({ commands: [script('process.exit(process.env.DB_PASSWORD === "hunter2" ? 0 : 1)')] })}\n[checks.env]\nDB_PASSWORD = "hunter2"\n`);
+  seed(repo);
+  fs.writeFileSync(path.join(repo, "a.txt"), "changed\n");
+  assert.deepStrictEqual(await runHook(GATE, stop(repo), { cwd: repo }), SILENT);
+  const run = lastRun(repo);
+  assert.strictEqual(run.verdict, "passed");
+  assert.deepStrictEqual(run.env, ["DB_PASSWORD=<redacted>"]);
+  assert.ok(!fs.readFileSync(path.join(repo, ".krites", "last-run.json"), "utf8").includes("hunter2"));
+});
+
+test("gate: a stop never starts a slow check, and records it as configured", async () => {
+  const marker = path.join(tmp, `slow-ran${Date.now()}.txt`);
+  const slow = script(`require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran");`);
+  const repo = makeRepo({ files: { "a.txt": "a\n" } });
+  configure(repo, { commands: [fail()], slow: [slow] });
+  seed(repo);
+  fs.writeFileSync(path.join(repo, "a.txt"), "changed\n");
+  assertBlock(await runHook(GATE, stop(repo), { cwd: repo }), /check\d+\.js/);
+
+  configure(repo, { commands: [pass()], slow: [slow] });
+  seed(repo);
+  fs.writeFileSync(path.join(repo, "a.txt"), "changed again\n");
+  assert.deepStrictEqual(await runHook(GATE, stop(repo), { cwd: repo }), SILENT);
+  assert.strictEqual(fs.existsSync(marker), false, "no stop ran the slow check");
+  const run = lastRun(repo);
+  assert.strictEqual(run.verdict, "passed");
+  assert.strictEqual(run.checks.length, 1);
+  assert.strictEqual(run.slow.length, 1);
+  assert.strictEqual(path.basename(run.slow[0][1]), path.basename(slow[1]));
+  assert.doesNotMatch(run.slow[0][1], ABSOLUTE, "recorded, scrubbed like commands");
+});
+
+test("gate: a stop on the tree /krites:verify passed carries its slow results, and only a clean pass does", async () => {
+  const repo = makeRepo({ files: { "a.txt": "a\n" } });
+  configure(repo, { commands: [pass()], slow: [pass()], timeoutSeconds: 60 });
+  seed(repo);
+  fs.writeFileSync(path.join(repo, "a.txt"), "changed\n");
+  await runCli(["verify"], { cwd: repo });
+  const verified = lastRun(repo);
+  assert.strictEqual(verified.checks.length, 2);
+  assert.deepStrictEqual(await runHook(GATE, stop(repo), { cwd: repo }), SILENT);
+  const carried = lastRun(repo);
+  assert.strictEqual(carried.verdict, "passed");
+  assert.deepStrictEqual(carried.checks.slice(1), verified.checks.slice(1), "exit codes and durations as verify recorded them");
+
+  fs.writeFileSync(path.join(repo, ".krites", "last-run.json"), JSON.stringify({ ...carried, config_hash: "another" }));
+  assert.deepStrictEqual(await runHook(GATE, stop(repo), { cwd: repo }), SILENT);
+  assert.strictEqual(lastRun(repo).checks.length, 1, "another krites.toml carries nothing");
+
+  const slowFails = makeRepo({ files: { "a.txt": "a\n" } });
+  configure(slowFails, { commands: [pass()], slow: [fail()], timeoutSeconds: 60 });
+  seed(slowFails);
+  fs.writeFileSync(path.join(slowFails, "a.txt"), "changed\n");
+  await runCli(["verify"], { cwd: slowFails });
+  assert.strictEqual(lastRun(slowFails).checks.length, 2);
+  assert.deepStrictEqual(await runHook(GATE, stop(slowFails), { cwd: slowFails }), SILENT);
+  assert.strictEqual(lastRun(slowFails).checks.length, 1, "a failed slow check is not carried");
+
+  const marker = path.join(tmp, `refute${Date.now()}.txt`);
+  const flaky = script(`process.exit(require("node:fs").existsSync(${JSON.stringify(marker)}) ? 1 : 0)`);
+  const refuted = makeRepo({ files: { "a.txt": "a\n" } });
+  configure(refuted, { commands: [flaky], slow: [pass()], timeoutSeconds: 60 });
+  seed(refuted);
+  fs.writeFileSync(path.join(refuted, "a.txt"), "changed\n");
+  await runCli(["verify"], { cwd: refuted });
+  assert.strictEqual(lastRun(refuted).verdict, "passed");
+  fs.writeFileSync(marker, "x");
+  assertBlock(await runHook(GATE, stop(refuted), { cwd: refuted }), /check\d+\.js/);
+  const run = lastRun(refuted);
+  assert.deepStrictEqual([run.verdict, run.checks.length], ["refuted", 1], "a refuted stop carries nothing");
 });

@@ -61,6 +61,21 @@ test("session: an empty command list says so in one line, and still records the 
   assert.strictEqual(baseline(repo), head(repo));
 });
 
+test("session: slow checks alone say they run only under /krites:verify; both empty keep the no-checks line", async () => {
+  const slowOnly = configure(makeRepo({ files: { "a.txt": "a\n" } }), { commands: [], slow: [script("")] });
+  assert.strictEqual(
+    assertOneLine(await runHook(SESSION, start(slowOnly), { cwd: slowOnly })).trimEnd(),
+    "Tell the user: krites.toml runs no check at a stop; [checks].slow runs only under /krites:verify.",
+  );
+  const empty = configure(makeRepo({ files: { "a.txt": "a\n" } }), { commands: [], slow: [] });
+  assert.strictEqual(
+    assertOneLine(await runHook(SESSION, start(empty), { cwd: empty })).trimEnd(),
+    "Tell the user: krites.toml configures no checks, so nothing is being checked until [checks].commands names a command.",
+  );
+  const both = configure(makeRepo({ files: { "a.txt": "a\n" } }), { commands: [script("")], slow: [script("")] });
+  assert.deepStrictEqual(await runHook(SESSION, start(both), { cwd: both }), SILENT);
+});
+
 test("session: a spent budget is reported in one line, and every start resets the counter", async () => {
   const repo = configure(makeRepo({ files: { "a.txt": "a\n" } }), { commands: [script("")] });
   writeBlockCount(repo, 4);

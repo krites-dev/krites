@@ -58,3 +58,10 @@ test("glob: separators and unicode form do not decide the match", () => {
   assert.strictEqual(matches("café/**", "café/x.txt"), true);
   assert.strictEqual(matches("café/**", "café/x.txt"), true);
 });
+
+test("glob: case folding can be turned off", () => {
+  assert.strictEqual(matches("home/q/Work/**", "home/q/work/a.md"), true);
+  assert.strictEqual(matches("home/q/Work/**", "home/q/work/a.md", { fold: false }), false);
+  assert.strictEqual(matches("home/q/Work/**", "home/q/Work/a.md", { fold: false }), true);
+  assert.strictEqual(matches("home/q/Work/**", "home/q/work/a.md"), true, "the unfolded pattern is cached apart from the folded one");
+});

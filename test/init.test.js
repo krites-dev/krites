@@ -10,7 +10,19 @@ const { ABSOLUTE, assertBlock, configure, makeDir, makeRepo, runCli, runHook, sc
 
 const GATE = path.join(__dirname, "..", "hooks", "gate.js");
 const SILENT = { code: 0, stdout: "", stderr: "" };
-const GLOBS = ["tests/krites/**", "krites.toml", ".claude/**"];
+const GLOBS = [
+  "tests/krites/**",
+  "krites.toml",
+  ".claude/settings.json",
+  ".claude/settings.local.json",
+  ".claude/hooks/**",
+  ".claude/agents/**",
+  ".claude/commands/**",
+  ".claude/skills/**",
+  ".mcp.json",
+  ".claude/output-styles/**",
+  ".claude/rules/**",
+];
 const CARGO = ["cargo fmt --check", "cargo clippy --all-targets -- -D warnings"];
 const SCRIPTS = JSON.stringify({ scripts: { typecheck: "tsc", lint: "eslint .", test: "node --test" } });
 
@@ -121,6 +133,26 @@ test("init: --write on an existing krites.toml records its hash and never change
   assert.deepStrictEqual(await runHook(GATE, stop(repo), { cwd: repo }), SILENT, "the stop passes once the config is approved");
 });
 
+test("init: approving a krites.toml shows the [checks.env] it runs with", async () => {
+  const repo = makeRepo({ files: { "a.txt": "a\n" } });
+  configure(repo, `version = 1\n\n[checks]\ncommands = ["make vulncheck"]\n\n[checks.env]\nGOTOOLCHAIN = "go1.26.6"\nAPI_TOKEN = "sk-abcdefghijklmnopqrstuvwxyz0123"\n`);
+  const result = await runCli(["init"], { cwd: repo });
+  assert.match(result.stdout, /runs:\n {2}make vulncheck\nwith this environment:\n {2}GOTOOLCHAIN=go1\.26\.6\n {2}API_TOKEN=<redacted>\n/);
+  assert.ok(!result.stdout.includes("sk-abcdefghij"));
+});
+
+test("init: approving a krites.toml lists its slow checks apart, and says when a stop runs none", async () => {
+  const both = makeRepo({ files: { "a.txt": "a\n" } });
+  configure(both, 'version = 1\n\n[checks]\ncommands = ["cargo test"]\nslow = ["cargo test --release"]\n');
+  assert.match((await runCli(["init"], { cwd: both })).stdout, /runs:\n {2}cargo test\nand under \/krites:verify only:\n {2}cargo test --release\n/);
+
+  const onlySlow = makeRepo({ files: { "a.txt": "a\n" } });
+  configure(onlySlow, 'version = 1\n\n[checks]\nslow = ["cargo test --release"]\n');
+  const out = (await runCli(["init"], { cwd: onlySlow })).stdout;
+  assert.match(out, /krites\.toml is here and runs no check at a stop\.\nand under \/krites:verify only:\n {2}cargo test --release\n/);
+  assert.doesNotMatch(out, /configures no checks/);
+});
+
 test("init: an existing krites.toml that does not load prints the error and writes nothing", async () => {
   const dir = makeDir({ "krites.toml": "version = 1\n\n[checks]\nnope = 1\n" });
   const before = listing(dir);
@@ -181,4 +213,112 @@ test("init: an unknown subcommand or argument prints one usage line and writes n
     assert.strictEqual(result.stdout.split("\n").filter(Boolean).length, 1, `${label}: one usage line`);
     assert.deepStrictEqual(listing(dir), before, label);
   }
+});
+
+test("init: the proposed globs protect Claude Code's settings, hooks, agents, commands and skills and leave the rest of .claude editable", async () => {
+  const { decide } = require("../hooks/protect.js");
+  const { findRoots } = require("../lib/config.js");
+  const repo = makeRepo({ files: { "a.txt": "a\n", "package.json": "{}\n" } });
+  assert.strictEqual((await runCli(["init", "--write"], { cwd: repo })).code, 0);
+  assert.match(fs.readFileSync(path.join(repo, "krites.toml"), "utf8"), /^globs = \["tests\/krites\/\*\*", "krites\.toml", "\.claude\/settings\.json", "\.claude\/settings\.local\.json", "\.claude\/hooks\/\*\*", "\.claude\/agents\/\*\*", "\.claude\/commands\/\*\*", "\.claude\/skills\/\*\*", "\.mcp\.json", "\.claude\/output-styles\/\*\*", "\.claude\/rules\/\*\*"\]$/m);
+
+  const roots = findRoots({ cwd: repo, processCwd: repo });
+  const edit = (...parts) => decide({ tool_input: { file_path: path.join(repo, ...parts) } }, roots);
+  assert.strictEqual(edit(".claude", "notes", "STATE.md"), null);
+  for (const parts of [[".claude", "settings.json"], [".claude", "settings.local.json"], [".claude", "hooks", "guard.js"], [".claude", "agents", "x.md"], [".claude", "commands", "c.md"], [".claude", "skills", "s", "SKILL.md"], [".mcp.json"], [".claude", "output-styles", "o.md"], [".claude", "rules", "r.md"]]) {
+    assert.match(edit(...parts), /is protected/, parts.join("/"));
+  }
+});
+
+const hooked = (...commands) =>
+  JSON.stringify({ hooks: { PreToolUse: [{ matcher: "Bash", hooks: commands.map((command) => ({ type: "command", command })) }] } });
+const globsOf = (stdout) => JSON.parse(stdout.match(/^globs = (\[.*\])$/m)[1]);
+
+test("init: a repo hook script outside .claude/hooks is proposed after the fixed globs, and nothing else is", async () => {
+  const dir = makeDir({
+    "package.json": "{}",
+    "scripts/guard.js": "x",
+    "tools/check.sh": "x",
+    "tools/local.js": "x",
+    "tests/krites/covered.js": "x",
+    ".claude/hooks/x.js": "x",
+    ".claude/settings.json": hooked("node scripts/guard.js", '"$CLAUDE_PROJECT_DIR"/tools/check.sh', "node .claude/hooks/x.js", "npx something", "node tests/krites/covered.js", "node scripts/missing.js"),
+    ".claude/settings.local.json": hooked("node ${CLAUDE_PROJECT_DIR}/tools/local.js"),
+  });
+  const before = listing(dir);
+  const result = await runCli(["init"], { cwd: dir });
+  assert.deepStrictEqual(globsOf(result.stdout), [...GLOBS, "scripts/guard.js", "tools/check.sh", "tools/local.js"]);
+  assert.doesNotMatch(result.stdout, ABSOLUTE);
+  assert.deepStrictEqual(listing(dir), before, "plain init writes nothing");
+
+  const written = await runCli(["init", "--write"], { cwd: dir });
+  assert.strictEqual(written.code, 0, written.stdout);
+  const loaded = loadConfig(dir);
+  assert.strictEqual(loaded.ok, true, loaded.error);
+  assert.deepStrictEqual(loaded.config.protect.globs, [...GLOBS, "scripts/guard.js", "tools/check.sh", "tools/local.js"]);
+});
+
+test("init: a settings file that does not parse still gives the fixed globs", async () => {
+  const dir = makeDir({ "package.json": "{}", "scripts/guard.js": "x", ".claude/settings.json": "{ not json", ".claude/settings.local.json": '{"hooks": 3}' });
+  const result = await runCli(["init"], { cwd: dir });
+  assert.strictEqual(result.code, 0);
+  assert.deepStrictEqual(globsOf(result.stdout), GLOBS);
+});
+
+const WINDOWS = process.platform === "win32";
+const scriptsFor = (files, ...commands) => cli.hookScripts(makeDir({ ...files, ".claude/settings.json": hooked(...commands) }));
+
+test("init: only scripts are proposed, never the data files a command names", () => {
+  const files = { "src/index.css": "x", "package.json": "{}", "scripts/guard.js": "x", "bin/hook": "x", "notes.txt": "x" };
+  assert.deepStrictEqual(scriptsFor(files, "npx prettier --check src/index.ts src/index.css package.json"), []);
+  assert.deepStrictEqual(scriptsFor(files, "node scripts/guard.js notes.txt"), ["scripts/guard.js"]);
+  assert.deepStrictEqual(scriptsFor(files, "bin/hook notes.txt"), ["bin/hook"], "the first token counts whatever its extension");
+});
+
+test("init: a quoted script path keeps its spaces", () => {
+  const files = { "my scripts/g.js": "x", "scripts/g.js": "x" };
+  assert.deepStrictEqual(scriptsFor(files, 'node "$CLAUDE_PROJECT_DIR/my scripts/g.js"'), ["my scripts/g.js"]);
+  assert.deepStrictEqual(scriptsFor(files, "node '${CLAUDE_PROJECT_DIR}/my scripts/g.js'"), ["my scripts/g.js"]);
+});
+
+test("init: a script reached through a link is proposed by both names, and one whose real path leaves the repo never is", () => {
+  const dir = makeDir({ "real/g.js": "x", ".claude/settings.json": hooked("node linked/g.js", "node away/x.js") });
+  const away = makeDir({ "x.js": "x" });
+  fs.symlinkSync(path.join(dir, "real"), path.join(dir, "linked"), "junction");
+  fs.symlinkSync(away, path.join(dir, "away"), "junction");
+  assert.deepStrictEqual(cli.hookScripts(dir), ["linked/g.js", "real/g.js"]);
+});
+
+test("init: a $ in the repo path is taken literally", () => {
+  const dir = path.join(makeDir(), "a$&b");
+  fs.mkdirSync(path.join(dir, "tools"), { recursive: true });
+  fs.mkdirSync(path.join(dir, ".claude"));
+  fs.writeFileSync(path.join(dir, "tools", "check.sh"), "x");
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), hooked('"$CLAUDE_PROJECT_DIR"/tools/check.sh'));
+  assert.deepStrictEqual(cli.hookScripts(dir), ["tools/check.sh"]);
+});
+
+test("init: a name with * ? a backslash or a control character is never proposed, and brackets are written as they are", () => {
+  const files = { "a[1].js": "x", "b{c}.js": "x", ...(WINDOWS ? {} : { "q?.js": "x", "s*.js": "x", "c\u0001.js": "x", "d\\e.js": "x" }) };
+  const names = Object.keys(files);
+  assert.deepStrictEqual(scriptsFor(files, `node ${names.map((name) => `'${name}'`).join(" ")}`), ["a[1].js", "b{c}.js"]);
+});
+
+test("init: a settings path that is not a regular file is skipped", { skip: WINDOWS && "win32 has no FIFO" }, () => {
+  const dir = makeDir({ "scripts/g.js": "x", ".claude/settings.local.json/x": "x" });
+  assert.strictEqual(require("node:child_process").spawnSync("mkfifo", [path.join(dir, ".claude", "settings.json")]).status, 0);
+  assert.deepStrictEqual(cli.hookScripts(dir), []);
+});
+
+test("init: a settings path that is a directory is skipped", () => {
+  assert.deepStrictEqual(cli.hookScripts(makeDir({ "scripts/g.js": "x", ".claude/settings.json/x": "x" })), []);
+});
+
+test("init: absolute, dotted and backslashed script paths resolve against the repo", () => {
+  const outside = makeDir({ "x.js": "x" });
+  const dir = makeDir({ "scripts/abs.js": "x", "tools/t.js": "x", "scripts/guard.js": "x" });
+  fs.mkdirSync(path.join(dir, ".claude"));
+  const commands = [`node "${path.join(dir, "scripts", "abs.js")}"`, "node scripts/../tools/t.js", `node ../${path.basename(outside)}/x.js`, "node scripts\\guard.js"];
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), hooked(...commands));
+  assert.deepStrictEqual(cli.hookScripts(dir), WINDOWS ? ["scripts/abs.js", "scripts/guard.js", "tools/t.js"] : ["scripts/abs.js", "tools/t.js"]);
 });

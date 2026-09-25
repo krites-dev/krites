@@ -6,14 +6,28 @@ const { findRoots, loadConfig } = require("./lib/config.js");
 const ping = require("./lib/ping.js");
 const receipts = require("./lib/receipt.js");
 const { scrub } = require("./lib/scrub.js");
+const settings = require("./lib/settings.js");
 const state = require("./lib/state.js");
+const { matches } = require("./lib/glob.js");
 
 // The Bash tool delivers a run of up to 600 s when the model passes the parameter (spikes/claude-plugin/NOTES.md);
 // the minute below it is the margin for the checks to be killed and the verdict written.
 const CAP_SECONDS = 540;
 const CAP_MS = CAP_SECONDS * 1000;
 const STARTED = Date.now();
-const GLOBS = ["tests/krites/**", "krites.toml", ".claude/**"];
+const GLOBS = [
+  "tests/krites/**",
+  "krites.toml",
+  ".claude/settings.json",
+  ".claude/settings.local.json",
+  ".claude/hooks/**",
+  ".claude/agents/**",
+  ".claude/commands/**",
+  ".claude/skills/**",
+  ".mcp.json",
+  ".claude/output-styles/**",
+  ".claude/rules/**",
+];
 const MARKERS = "Cargo.toml, package.json, pyproject.toml, pytest.ini or go.mod";
 const NO_CHECKS = "krites.toml configures no checks, so nothing ran.";
 const NO_ROOT = "This repo has no krites.toml, so Krites is checking nothing. Run /krites:init.";
@@ -53,7 +67,73 @@ function detect(dir) {
   return null;
 }
 
-function proposal(commands) {
+const isFile = (file) => {
+  try {
+    return fs.statSync(file).isFile();
+  } catch {
+    return false;
+  }
+};
+
+const SCRIPT = /\.(?:[mc]?[jt]s|sh|bash|zsh|ps1|psm1|cmd|bat|py|rb|pl|php|lua)$/i;
+const PROJECT = /^\$(?:\{CLAUDE_PROJECT_DIR\}|CLAUDE_PROJECT_DIR)(?=[\\/]|$)/;
+// glob.js reads * ? and a backslash as pattern, and krites.toml cannot hold a control character or a lone surrogate.
+const exact = (rel) => !/[*?\\]/.test(rel) && ![...rel].some((ch) => ch < " ") && rel.isWellFormed();
+
+// Quotes group words and are dropped, as a shell would; a lone quote stays as text.
+const tokens = (command) =>
+  (command.match(/(?:"[^"]*"|'[^']*'|[^\s"']|["'])+/g) || []).map((token) => token.replace(/"([^"]*)"|'([^']*)'/g, "$1$2"));
+
+function within(dir, target) {
+  const rel = path.relative(dir, target).split(path.sep).join("/");
+  return rel === "" || rel === ".." || rel.startsWith("../") || path.isAbsolute(rel) ? null : rel;
+}
+
+// Files in the repo that a hook in its own settings runs, so an agent cannot rewrite what guards it.
+function hookScripts(root) {
+  const found = new Set();
+  let realRoot;
+  try {
+    realRoot = fs.realpathSync.native(root);
+  } catch {
+    realRoot = root;
+  }
+  const propose = (rel) => {
+    if (rel !== null && !rel.startsWith(".claude/hooks/") && exact(rel) && !GLOBS.some((glob) => matches(glob, rel))) found.add(rel);
+  };
+  for (const name of ["settings.json", "settings.local.json"]) {
+    const file = path.join(root, ".claude", name);
+    let settings;
+    try {
+      settings = isFile(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : null;
+    } catch {
+      continue;
+    }
+    const events = settings && typeof settings.hooks === "object" && settings.hooks !== null ? Object.values(settings.hooks) : [];
+    for (const group of events.flat()) {
+      for (const hook of (group && Array.isArray(group.hooks) && group.hooks) || []) {
+        if (!hook || hook.type !== "command" || typeof hook.command !== "string") continue;
+        tokens(hook.command).forEach((token, index) => {
+          if (index > 0 && !SCRIPT.test(token)) return;
+          const named = path.resolve(root, token.replace(PROJECT, () => root));
+          if (!isFile(named)) return;
+          let real;
+          try {
+            real = within(realRoot, fs.realpathSync.native(named));
+          } catch {
+            return;
+          }
+          if (real === null) return;
+          propose(within(root, named));
+          propose(real);
+        });
+      }
+    }
+  }
+  return [...found].sort();
+}
+
+function proposal(commands, scripts = []) {
   const list = commands.length === 0 ? "[]" : `[\n${commands.map((command) => `  ${JSON.stringify(command)},\n`).join("")}]`;
   return `${[
     "version = 1",
@@ -64,7 +144,7 @@ function proposal(commands) {
     "max_blocks = 3",
     "",
     "[protect]",
-    `globs = [${GLOBS.map((glob) => JSON.stringify(glob)).join(", ")}]`,
+    `globs = [${[...GLOBS, ...scripts].map((glob) => JSON.stringify(glob)).join(", ")}]`,
     "",
     "[receipts]",
     'dir = "receipts"',
@@ -75,7 +155,13 @@ function approve(root, write) {
   const loaded = loadConfig(root);
   if (!loaded.ok) return say(loaded.error, root);
   const listed = loaded.config.checks.commands.map((argv) => `  ${argv.join(" ")}`);
-  say(listed.length === 0 ? "krites.toml is here and configures no checks." : ["krites.toml is here and runs:", ...listed].join("\n"), root);
+  const env = Object.entries(loaded.config.checks.env).map(([name, value]) => `  ${name}=${value}`);
+  const slow = loaded.config.checks.slow.map((argv) => `  ${argv.join(" ")}`);
+  const none = slow.length === 0 ? "krites.toml is here and configures no checks." : "krites.toml is here and runs no check at a stop.";
+  const lines = listed.length === 0 ? [none] : ["krites.toml is here and runs:", ...listed];
+  if (slow.length > 0) lines.push("and under /krites:verify only:", ...slow);
+  if (env.length > 0) lines.push("with this environment:", ...env);
+  say(lines.join("\n"), root);
   if (!write) return say("Nothing was written. Run /krites:init --write to approve this krites.toml for the gate.", root);
   state.writeConfigHash(root, loaded.hash);
   say("The gate now accepts this krites.toml.", root);
@@ -91,7 +177,7 @@ function init(args) {
 
   const commands = detect(root);
   if (commands === null) return say(`No ${MARKERS} is here, so there is nothing to propose. Write krites.toml by hand.`, root);
-  const text = proposal(commands);
+  const text = proposal(commands, hookScripts(root));
   say(text.trimEnd(), root);
   if (!write) return say("Nothing was written. Run /krites:init --write to create it.", root);
   fs.writeFileSync(path.join(root, "krites.toml"), text, { flag: "wx" });
@@ -125,45 +211,54 @@ const endLine = (check, judged, seconds, last) => {
 
 const verify = ({ capMs, startedAt }) =>
   eachRoot(async (root, loaded) => {
-    const seconds = loaded.config.checks.timeout_seconds;
-    // Taken before any work, so a root with no budget left is left as it was instead of being killed mid-check.
-    const ms = deadlineMs(seconds, Date.now() - startedAt, capMs);
-    if (ms === 0) return say(spentLine(capMs), root);
-    const { head, dirty, baseline } = gate.treeState(root);
-    // Read again when the checks start, so this root's own fingerprints and git calls come out of its deadline;
-    // when they have spent it all, no check is started just to be killed and recorded over the last good run.
-    const deadline = () => {
-      const left = deadlineMs(seconds, Date.now() - startedAt, capMs);
-      if (left === 0) throw SPENT;
-      return left;
-    };
-    let judged;
-    try {
-      judged = await gate.judge(root, loaded, { baseline, deadline });
-    } catch (err) {
-      if (err === SPENT) return say(spentLine(capMs), root);
-      throw err;
-    }
-    if (judged.failed) return say(`${judged.failed}.`, root);
-
-    gate.recordRun(root, loaded, judged, { head, dirty, baseline, reason: judged.reason, session_id: null });
-    if (judged.touched) return say(judged.reason, root);
-    if (judged.run.verdict === "no_checks") return say(NO_CHECKS, root);
-    const last = judged.run.checks[judged.run.checks.length - 1];
-    for (const check of judged.run.checks) {
-      say(check.command, root);
-      // The captured tail ends in the newline the check printed, which would read here as a blank line.
-      const tail = check.tail.replace(/\n+$/, "");
-      if (tail !== "") say(tail, root);
-      say(endLine(check, judged, seconds, last), root);
-    }
+    await checkRoot(root, loaded, { capMs, startedAt });
+    const { off, unreadable } = settings.survey(root);
+    for (const file of unreadable) say(settings.unknown(file), root);
+    if (off !== null) say(settings.describe(off), root);
   });
+
+async function checkRoot(root, loaded, { capMs, startedAt }) {
+  const seconds = loaded.config.checks.timeout_seconds;
+  // Taken before any work, so a root with no budget left is left as it was instead of being killed mid-check.
+  const ms = deadlineMs(seconds, Date.now() - startedAt, capMs);
+  if (ms === 0) return say(spentLine(capMs), root);
+  const { head, dirty, baseline } = gate.treeState(root);
+  // Read again when the checks start, so this root's own fingerprints and git calls come out of its deadline;
+  // when they have spent it all, no check is started just to be killed and recorded over the last good run.
+  const deadline = () => {
+    const left = deadlineMs(seconds, Date.now() - startedAt, capMs);
+    if (left === 0) throw SPENT;
+    return left;
+  };
+  let judged;
+  try {
+    const commands = [...loaded.config.checks.commands, ...loaded.config.checks.slow];
+    judged = await gate.judge(root, loaded, { baseline, deadline, commands });
+  } catch (err) {
+    if (err === SPENT) return say(spentLine(capMs), root);
+    throw err;
+  }
+  if (judged.failed) return say(`${judged.failed}.`, root);
+
+  gate.recordRun(root, loaded, judged, { head, dirty, baseline, reason: judged.reason, session_id: null });
+  if (judged.touched) return say(judged.reason, root);
+  if (judged.run.verdict === "no_checks") return say(NO_CHECKS, root);
+  const last = judged.run.checks[judged.run.checks.length - 1];
+  for (const check of judged.run.checks) {
+    say(check.command, root);
+    // The captured tail ends in the newline the check printed, which would read here as a blank line.
+    const tail = check.tail.replace(/\n+$/, "");
+    if (tail !== "") say(tail, root);
+    say(endLine(check, judged, seconds, last), root);
+  }
+}
 
 const receipt = () =>
   eachRoot((root, loaded) => {
     const dir = loaded.config.receipts.dir;
     const already = receipts.existing(root, dir);
     if (already !== null) return say(`This run's receipt is already at ${already}.`, root);
+    for (const file of settings.survey(root).unreadable) say(settings.unknown(file), root);
     const built = receipts.build(root);
     if (!built.ok) return say(built.reason, root);
     const written = receipts.write(root, built.receipt, dir);
@@ -213,4 +308,4 @@ if (require.main === module) {
     .then((text) => process.stdout.write(text, () => process.exit(0)));
 }
 
-module.exports = { deadlineMs, detect, main, proposal, timeoutLine };
+module.exports = { deadlineMs, detect, hookScripts, main, proposal, timeoutLine };

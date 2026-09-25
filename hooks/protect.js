@@ -1,9 +1,11 @@
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 
-const { findRoots, loadConfig, protectedGlobs } = require("../lib/config.js");
+const { findRoots, loadConfig, loadUserConfig, protectedGlobs } = require("../lib/config.js");
 const { matches } = require("../lib/glob.js");
 const hookio = require("../lib/hookio.js");
+const { configDir } = require("../lib/sign.js");
 
 const PATH_KEYS = ["file_path", "path", "notebook_path"];
 const UNC = /^[\\/]{2}(?:[?.][\\/]UNC[\\/]|(?![?.][\\/]))/i;
@@ -49,6 +51,54 @@ function inside(dir, target) {
   return rel !== "" && rel !== ".." && !rel.startsWith("../") && !path.isAbsolute(rel);
 }
 
+const within = (dir, target) => path.relative(dir, target) === "" || inside(dir, target);
+
+function resolved(dir) {
+  try {
+    return realTarget(dir);
+  } catch {
+    return dir;
+  }
+}
+
+// Only the user's own config.toml opens a path outside every repo, and never the folders that hold the signing key,
+// that config, or Claude Code's own settings. The target is already resolved, so a link cannot lead past these.
+function outsideReason(target, name, outside) {
+  const { root } = path.parse(target);
+  const rest = target.slice(root.length);
+  if (WINDOWS && rest.includes(":")) return `Blocked: ${name} names an alternate data stream.`;
+  const parts = rest.split(/[\\/]+/).filter(Boolean).map((part) => (WINDOWS ? part.replace(/[. ]+$/, "") : part));
+  if (parts.includes("")) return `Blocked: ${name} has a path component made only of dots or spaces.`;
+  const loaded = loadUserConfig(configDir());
+  if (!loaded.ok) return `Blocked: ${name} resolves outside the repository, and ${loaded.error}.`;
+  const home = resolved(os.homedir());
+  const clean = path.join(root, ...parts);
+  const expand = (entry) => (/^~[\\/]/.test(entry) ? path.join(home, entry.slice(2)) : entry);
+  const fold = WINDOWS || process.platform === "darwin";
+  if (!loaded.allowOutside.some((entry) => matches(expand(entry), clean, { fold }))) return outside;
+  // Folded on every OS: a home on a case-insensitive volume under Linux still reaches ~/.claude as ~/.CLAUDE.
+  const key = (file) => file.normalize("NFC").toLowerCase();
+  const claudeDir = process.env.CLAUDE_CONFIG_DIR;
+  // A relative value is closed against every cwd Claude Code may have taken it from.
+  const bases = claudeDir && !path.isAbsolute(claudeDir) ? [process.cwd(), process.env.CLAUDE_PROJECT_DIR].filter(Boolean) : [""];
+  const claudeDirs = claudeDir ? bases.map((base) => path.resolve(base, claudeDir)) : [];
+  const tidy = (dir) => {
+    const top = path.parse(dir).root;
+    return path.join(top, ...dir.slice(top.length).split(/[\\/]+/).filter(Boolean).map((part) => (WINDOWS ? part.replace(/[. ]+$/, "") : part)));
+  };
+  // A share is never touched: a slow one would outlast the hook's timeout, which lets the write through.
+  const withReal = (dir) => (UNC.test(dir) ? [dir] : [dir, resolved(dir)]);
+  const own = [configDir(), path.join(os.homedir(), ".claude"), ...claudeDirs].flatMap(withReal).map(tidy);
+  // Claude Code's global file, and its suffixed variants such as .claude-custom-oauth.json.
+  const homes = withReal(os.homedir()).map(tidy).map(key);
+  const globalFile = (file) => homes.includes(key(path.dirname(file))) && /^\.claude[^\\/]*\.json$/i.test(path.basename(file));
+  const linkedJson = resolved(path.join(os.homedir(), ".claude.json"));
+  if (own.some((dir) => within(key(dir), key(clean))) || globalFile(clean) || key(tidy(linkedJson)) === key(clean)) {
+    return `Blocked: ${name} is in Claude Code's or Krites's own configuration, which allow_outside never opens.`;
+  }
+  return null;
+}
+
 function reasonFor(file, roots, configs, memoryOf) {
   if (typeof file !== "string" || file.includes("\0")) return "Blocked: the edit path is not a plain string.";
   // Either separator: on POSIX a backslash path is one long file name, and the reason must not echo it whole.
@@ -68,7 +118,7 @@ function reasonFor(file, roots, configs, memoryOf) {
   if (!best) {
     const memory = memoryOf();
     const allowed = memory && inside(memory, target) && !(WINDOWS && path.relative(memory, target).includes(":"));
-    return allowed ? null : outside;
+    return allowed ? null : outsideReason(target, name, outside);
   }
   if (WINDOWS && best.rel.includes(":")) return `Blocked: ${name} names an alternate data stream.`;
 

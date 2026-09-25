@@ -5,7 +5,7 @@ const { test } = require("node:test");
 
 const { BUDGET_MS, WATCHDOG_MS, budgetMs } = require("../hooks/gate.js");
 const { readBaseline, readBlockCount } = require("../lib/state.js");
-const { assertBlock, configure, git, makeRepo, runHook, script, seed, tmp, toml } = require("./helpers.js");
+const { assertBlock, configure, fromTmp, git, makeRepo, runHook, script, seed, tmp, toml } = require("./helpers.js");
 
 const GATE = path.join(__dirname, "..", "hooks", "gate.js");
 const stop = (cwd) => ({ hook_event_name: "Stop", stop_hook_active: false, session_id: "s1", cwd });
@@ -64,7 +64,7 @@ test("deadline: the watchdog spends an attempt, and the fourth stop is allowed",
   fs.writeFileSync(path.join(repo, "a.txt"), "changed\n");
 
   const payload = { hook_event_name: "Stop", session_id: "s1", cwd: repo };
-  const watched = () => freshGuarded()(payload, { watchdogMs: 3000, projectDir: repo });
+  const watched = () => fromTmp(() => freshGuarded()(payload, { watchdogMs: 3000, projectDir: repo }));
   const left = path.join(repo, ".krites", "last-run.json");
 
   for (let attempt = 1; attempt <= 4; attempt += 1) {
@@ -94,7 +94,7 @@ test("deadline: the watchdog charges the root it interrupted, not the one that a
   const left = path.join(outer, ".krites", "last-run.json");
   for (let attempt = 1; attempt <= 4; attempt += 1) {
     fs.rmSync(left, { force: true });
-    const reason = await freshGuarded()(payload, { watchdogMs: 3000, projectDir: outer });
+    const reason = await fromTmp(() => freshGuarded()(payload, { watchdogMs: 3000, projectDir: outer }));
     if (attempt < 4) assert.match(reason, /gate timed out after 3 s/);
     else assert.strictEqual(reason, null, "the chain ends with the interrupted root's budget");
     assert.strictEqual(readBlockCount(inner), 0, "the root that passed is never charged");
@@ -118,7 +118,7 @@ test("deadline: the watchdog never allows a stop while a config error is held", 
   const left = path.join(outer, ".krites", "last-run.json");
   for (let attempt = 1; attempt <= 5; attempt += 1) {
     fs.rmSync(left, { force: true });
-    const reason = await freshGuarded()(payload, { watchdogMs: 3000, projectDir: outer });
+    const reason = await fromTmp(() => freshGuarded()(payload, { watchdogMs: 3000, projectDir: outer }));
     // Attempts 4 and 5 find the interrupted root's budget spent: what is left to say is the config error, and it is said.
     assert.match(String(reason), /krites\.toml line 4: /, `stop ${attempt} is blocked and names the held config error: ${reason}`);
     if (attempt <= 3) assert.match(reason, /^Krites blocked the stop: gate timed out after 3 s/, `stop ${attempt}: the watchdog's own reason comes first`);

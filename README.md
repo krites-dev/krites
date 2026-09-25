@@ -18,15 +18,64 @@ Krites runs your coding agent's work through checks the agent cannot touch and w
 
 Commit `krites.toml`. Until a repo has one, the plugin checks nothing there and says so once at session start.
 
+Krites is built by Quinn Lott, hello@krites.dev. Report a vulnerability privately to that address, not in a public issue; see [SECURITY.md](SECURITY.md).
+
+## Pinning
+
+The install above follows this repo's default branch. Claude Code leaves auto-update off for a third-party marketplace by default, so nothing changes until you update it, but a reviewed install should name a release. Every release is tagged `krites--v<version>`, where `<version>` is the one in `.claude-plugin/plugin.json` of the release you reviewed. The release script never moves or remakes a pushed tag, but a tag can still be moved by hand on GitHub, so pin the commit too when that matters. Add the marketplace at a tag with `#` and the ref:
+
+```text
+/plugin marketplace add https://github.com/krites-dev/krites.git#krites--v<version>
+/plugin install krites@krites
+```
+
+A team marketplace can pin the commit as well. In its `marketplace.json`, this entry goes in `plugins`; a `github` source takes `ref` and `sha`, and when both are set the `sha` is the effective pin:
+
+```json
+{
+  "name": "krites",
+  "source": { "source": "github", "repo": "krites-dev/krites", "ref": "krites--v<version>", "sha": "<the tagged commit, 40 hex characters>" }
+}
+```
+
+The tags are annotated, so the commit is the `^{}` line of `git ls-remote https://github.com/krites-dev/krites.git "refs/tags/krites--v<version>*"`, not the first hash it prints.
+
+To vendor it instead, clone the tag with `git clone --depth 1 --branch krites--v<version> https://github.com/krites-dev/krites.git vendor/krites`, review it, delete `vendor/krites/.git` so git commits the files and not a nested repo, commit it, and add it with `/plugin marketplace add ./vendor/krites`.
+
+Sources: [Discover and install plugins](https://code.claude.com/docs/en/discover-plugins) (the `#ref` form, auto-update defaults) and [Plugin marketplaces](https://code.claude.com/docs/en/plugin-marketplaces) (plugin sources, `ref` and `sha`).
+
 ## What it does
 
-- Denies the edit tools on the paths in `[protect]`, on `krites.toml`, `.krites/` and `.git/`, and on anything outside the repo except this project's Claude Code memory folder in its default place, the `memory/` beside the session transcript Claude Code names in every hook call, so Claude can still save memory there. A memory folder that is a link, or that lives inside a repo, gets no exception.
+- Denies the edit tools on the paths in `[protect]`, on `krites.toml`, `.krites/` and `.git/`, and on anything outside the repo except this project's Claude Code memory folder in its default place, the `memory/` beside the session transcript Claude Code names in every hook call, so Claude can still save memory there. A memory folder that is a link, or that lives inside a repo, gets no exception. Other folders outside the repo open only through your own user config (see Writing outside the repo).
 - Runs `[checks].commands` in order when the agent tries to stop and blocks the stop on the first failure, with the command and the last 60 lines of its output as the reason.
+- Runs `[checks].slow` only under `/krites:verify`, after `commands` and only when every one of them passed. A stop never starts a slow check; its receipt lists them as not run, unless its own commands passed and the latest recorded run is a passed `/krites:verify` run on the same tree fingerprint and config hash with every slow check at exit 0, whose slow results it then carries.
 - Exports a signed receipt of the last run.
 
-A run ends in one of four verdicts: `passed` (every check exited 0), `refuted` (a check failed, or a protected path changed by any tool, Bash included), `timed_out` (the run passed `timeout_seconds` and its process tree was killed), `no_checks` (no command is configured: the stop goes through, the receipt says `no_checks`, never `passed`, and the session start line tells you nothing is being checked). Krites never says `verified` in v0: the checks are yours, and nothing here vouches for them.
+A check command runs without a shell, so `GOTOOLCHAIN=go1.26.6 make vulncheck` does not set anything. Put the variable in `[checks.env]` instead, and every check, at a stop and under `/krites:verify`, gets it over the environment Claude Code started with:
+
+```toml
+[checks.env]
+GOTOOLCHAIN = "go1.26.6"
+```
+
+Names are letters, digits and `_`, and two names may not differ only in case. Values are used as written, with no `$VAR` expansion, and may not hold `"`, `&`, `|`, `<`, `>`, `^`, `%` or `!`, which cmd.exe would act on inside a Windows `.cmd` shim. The table is part of `krites.toml`, so changing it changes `config_hash` and needs `/krites:init` to approve it, which lists the assignments. That listing and `.krites/last-run.json` are scrubbed like the check output, so a secret-shaped value shows as `<redacted>` and a path loses its folders.
+
+A run ends in one of four verdicts: `passed` (every check exited 0), `refuted` (a check failed, or a protected path changed by any tool, Bash included), `timed_out` (the run passed `timeout_seconds` and its process tree was killed), `no_checks` (no command is configured: the stop goes through, the receipt says `no_checks`, never `passed`, and the session start line tells you nothing is being checked at a stop, or that `slow` runs only under `/krites:verify`). Krites never says `verified` in v0: the checks are yours, and nothing here vouches for them.
 
 The gate runs on every stop attempt. A failing check, a timeout or a changed protected path blocks at most `max_blocks` times in a row (default 3, 1 to 8); after that the stop is allowed, the run is recorded with the reason "attempt budget exhausted", and the next session start says so. The count resets when a gate passes, when a stop finds a clean tree at the session baseline, and when a session starts. A `krites.toml` that cannot be read, or a repo in which git cannot list what changed, is not counted: it blocks every stop until it is fixed.
+
+## Writing outside the repo
+
+A workflow that keeps scratchpads or plan logs outside the repo can open those folders to the edit tools in `config.toml` in your Krites config directory (`%APPDATA%\krites`, or `$XDG_CONFIG_HOME/krites`, or `~/.config/krites`, the folder that holds the signing key):
+
+```toml
+[protect]
+allow_outside = ["~/.claude-work/**"]
+```
+
+Each entry is a glob that starts with `~/`, `/`, or a drive letter such as `C:/` (either slash). A relative entry is an error, and until it is fixed every edit outside the repo is denied with the file, the line, and the key. The list is yours, not the repo's: a `krites.toml` cannot hold it, so a repo you clone cannot decide where in your home folder the agent may write. Four places stay closed whatever the list says: the Krites config directory itself (the signing key and this file), `~/.claude`, Claude Code's global file `~/.claude.json` (and any `~/.claude*.json`), and `$CLAUDE_CONFIG_DIR` while it holds a non-empty value (a relative value is closed against the working directory and the project directory). This project's memory folder keeps its own exception.
+
+An entry is matched against the target's real path, after links are followed, so a link inside an allowed folder that points elsewhere opens nothing. The list ignores case on Windows and macOS and follows it elsewhere; the closed places are closed in any case, on every system. `**` matches what is under a folder, not the folder itself.
 
 ## What a receipt proves
 
@@ -42,9 +91,9 @@ Reproduced by hand against the real hooks on 2026-09-18, Windows, after the core
 
 In the last row the file was tracked, so even that case was caught. The README limit applies only when the file was never committed.
 
-A receipt proves which commands ran, with which exit codes, on which diff at which commit, under which `krites.toml` (`config_hash`, and `commands` lists every configured check, including ones that never ran because an earlier one failed). It does not prove the tests are good. A signature proves the receipt was not altered after signing; it proves who signed only if you pin the key with `--key`, because anyone can make a key and sign a receipt they wrote by hand, and the verifier says "signer not pinned" when you do not.
+A receipt proves which commands ran, with which exit codes, on which diff at which commit, under which `krites.toml` (`config_hash`; `commands` and `slow` list every configured check, `not_run` names each one that did not run, because an earlier one failed or because a stop never runs `slow` and carries slow results only onto its own passing commands, from the latest recorded run when that is a passed `/krites:verify` run on the same tree fingerprint and config hash with every slow check at exit 0, and `env` holds the `[checks.env]` assignments, scrubbed). It does not prove the tests are good. A signature proves the receipt was not altered after signing; it proves who signed only if you pin the key with `--key`, because anyone can make a key and sign a receipt they wrote by hand, and the verifier says "signer not pinned" when you do not.
 
-A receipt is evidence from a machine you trust, not proof against the agent that ran on it. What gets signed is `.krites/last-run.json`, and the key sits in your user config directory: an agent with a shell can rewrite the first before you export, or read the second and sign on its own. `/krites:receipt` refuses a run file the gate could not have written (an unknown verdict, exit codes that contradict the verdict), and refuses when the tree changed since the run, but a carefully forged run file passes. Export receipts from a session you watched, or from CI.
+A receipt is evidence from a machine you trust, not proof against the agent that ran on it. What gets signed is `.krites/last-run.json`, and the key sits in your user config directory: an agent with a shell can rewrite the first before you export, or read the second and sign on its own. `/krites:receipt` refuses a run file the gate could not have written (an unknown verdict, exit codes that contradict the verdict), and refuses when the tree changed since the run, but a carefully forged run file passes. A forged run file can also be carried into the next passing stop, so the trust a receipt places in `last-run.json` is unchanged in kind: anything with a shell can write it. Export receipts from a session you watched, or from CI.
 
 ## What it does not do
 
@@ -63,12 +112,16 @@ The gate
 - A `krites.toml` that was never committed does not exist in a `claude -w` worktree session, so that session is inert apart from the session start line.
 - A commit made after the last gate of a session that was killed rather than stopped is not gated in the next session. A commit made on another branch and reached by checking back out is never gated. Work moved out of the tree before a stop (a stash, another branch) makes that stop a clean one: it resets the attempt count, and the next session start no longer reports attempts that gave up, though `last-run.json` still holds the exhausted run. A resumed or compacted session keeps its baseline and its block count.
 - The attempt budget is per `krites.toml`. Claude Code itself honors eight Stop blocks in a row and lets the ninth stop through, so several failing roots in one session can ask for more blocks than it grants; the last run then says refuted without the exhausted reason. After the watchdog or a crash, roots behind the interrupted one are not judged in that stop. A root whose `krites.toml` cannot be read, or whose changes git cannot list, blocks every stop until that is fixed, but it does not hold up the others: the roots behind it are still judged and recorded, and the block carries its reason along with the first failing root's. If `.krites/block-count` cannot be written, the gate keeps blocking and the reason names the file and the error code: a gate that cannot record does not let go silently. In these cases what ends the chain is Claude Code letting the ninth stop through, and no gave-up run is recorded for that root.
+- An `allow_outside` entry whose own folder is a link does not follow it: name the real folder (on macOS, `/private/tmp` rather than `/tmp`). Network shares are never opened, so an entry naming one matches nothing. Bash can still write the user config, as it can write anywhere.
+- Only the Krites config directory, `~/.claude`, `~/.claude*.json` and a non-empty `$CLAUDE_CONFIG_DIR` are closed; an empty one, which Claude Code reads as its working directory, closes nothing. A broad entry such as `~/**` still opens shell startup files, which can set `CLAUDE_CONFIG_DIR` or move the Krites config directory for the next session. Keep entries to the folders your workflow writes.
 - Killing a timed-out check takes its process tree with it, except descendants that detached themselves; under a PID 1 that does not reap, killed processes can linger as zombies.
 - Files over 5 MB, or past 64 MB in one pass, are fingerprinted by size and modification time, so a same-size in-place edit there during a run is not seen.
 
 `/krites:verify`
 
-- It runs through Claude Code's Bash tool, which delivers at most 600 s, and only when the model passes the timeout the command asks for. Under `/krites:verify` the checks of all roots together are cut off at 540 s; the stop gate allows up to `timeout_seconds` (at most 820). Long suites belong to the gate.
+- It runs through Claude Code's Bash tool, which delivers at most 600 s, and only when the model passes the timeout the command asks for. Under `/krites:verify` the checks of all roots together are cut off at 540 s; the stop gate allows up to `timeout_seconds` (at most 820). A `slow` check shares that budget with `commands` and with the roots before it, and one still running when the budget is spent is killed and recorded as timed out.
+- Suites longer than the 540 s cap belong in CI, since moving them to `slow` still takes them off the stop.
+- The line naming settings that turn Krites' hooks off reads the settings files only (user, project, local, and the managed file with its `managed-settings.d` drop-ins); managed settings from the Windows registry, a macOS plist or the server, and a `--settings` file, are not read. Project and local settings come from `$CLAUDE_PROJECT_DIR` when it is set and not empty. `KRITES_MANAGED_SETTINGS_DIR` replaces the managed directory; it is a test hook, not a setting.
 
 Receipts and keys
 

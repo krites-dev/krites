@@ -4,6 +4,7 @@ const { git, readBlockCount, writeBaseline, writeBlockCount, writeConfigHash } =
 
 const NUDGE = "Tell the user: Krites is installed but this repo has no krites.toml, so nothing is being checked. Run /krites:init to create one.";
 const NO_CHECKS = "Tell the user: krites.toml configures no checks, so nothing is being checked until [checks].commands names a command.";
+const SLOW_ONLY = "Tell the user: krites.toml runs no check at a stop; [checks].slow runs only under /krites:verify.";
 const GAVE_UP = (blocks) =>
   `Tell the user: in the last session the Krites stop gate gave up after ${blocks} blocked attempts, so that work ended without passing its checks. Run /krites:verify.`;
 
@@ -40,7 +41,8 @@ function startRoot(entry, lines) {
   if (!loaded.ok) return lines.push(`Tell the user: Krites is not running: ${loaded.error}`);
   writeBaseline(entry.root, (git(entry.root, ["rev-parse", "HEAD"]) || "").trim());
   if (loaded.hash !== undefined) writeConfigHash(entry.root, loaded.hash);
-  if (loaded.config.checks.commands.length === 0) lines.push(NO_CHECKS);
+  const { commands, slow } = loaded.config.checks;
+  if (commands.length === 0) lines.push(slow.length === 0 ? NO_CHECKS : SLOW_ONLY);
 }
 
 if (require.main === module) hookio.run({ handle, fail: (what) => `${FAILED(what)}\n` });

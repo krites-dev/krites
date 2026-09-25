@@ -4,7 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { test } = require("node:test");
 
-const { ABSOLUTE, configure, makeRepo, runCli, runHook, script, seed, tmp } = require("./helpers.js");
+const { ABSOLUTE, configure, makeDir, makeRepo, runCli, runHook, script, seed, tmp } = require("./helpers.js");
 
 const GATE = path.join(__dirname, "..", "hooks", "gate.js");
 const VERIFIER = path.join(__dirname, "..", "verify-receipt.js");
@@ -84,4 +84,36 @@ test("receipt: asking twice points at the file already written and writes nothin
   assert.strictEqual(again.stdout, `This run's receipt is already at ${written[0]}.\n`);
   assert.deepStrictEqual(listing(path.join(repo, DIR)), before, "no second file for one run");
   assert.ok(fs.readFileSync(path.join(repo, written[0])).equals(bytes), "the receipt already written is left as it was");
+});
+
+test("receipt: settings that turn the hooks off are named and nothing is written", async () => {
+  const repo = await ran([script("console.log('fine')")]);
+  const user = makeDir({ "settings.json": JSON.stringify({ enabledPlugins: { "krites@krites": false } }) });
+
+  const result = await runCli(["receipt"], { cwd: repo, env: { CLAUDE_CONFIG_DIR: user } });
+  assert.strictEqual(result.code, 0);
+  assert.strictEqual(result.stderr, "");
+  assert.strictEqual(result.stdout, 'Krites hooks are off for this repo: $CLAUDE_CONFIG_DIR/settings.json sets enabledPlugins["krites@krites"].\n');
+  assert.strictEqual(listing(path.join(repo, DIR)), null, "a refusal writes no receipts directory");
+});
+
+test("receipt: allowManagedHooksOnly alone does not refuse", async () => {
+  const repo = await ran([script("console.log('fine')")]);
+  const env = { KRITES_MANAGED_SETTINGS_DIR: makeDir({ "managed-settings.json": JSON.stringify({ allowManagedHooksOnly: true }) }) };
+
+  const result = await runCli(["receipt"], { cwd: repo, env });
+  assert.strictEqual(result.stderr, "");
+  assert.match(result.stdout, /^receipts\/[0-9A-Za-z._-]+\.json\nreceipts\/[0-9A-Za-z._-]+\.md\n$/);
+});
+
+test("receipt: a settings file that does not parse is named and the receipt is still written", async () => {
+  const repo = await ran([script("console.log('fine')")]);
+  const env = { CLAUDE_CONFIG_DIR: makeDir({ "settings.json": `${String.fromCharCode(0xfeff)}{broken` }) };
+
+  const result = await runCli(["receipt"], { cwd: repo, env });
+  assert.strictEqual(result.stderr, "");
+  const lines = result.stdout.trimEnd().split("\n");
+  assert.strictEqual(lines[0], "Krites cannot read $CLAUDE_CONFIG_DIR/settings.json, so its hooks setting is unknown.");
+  assert.match(lines[1], /^receipts\/[0-9A-Za-z._-]+\.json$/);
+  assert.ok(fs.existsSync(path.join(repo, lines[1])), result.stdout);
 });

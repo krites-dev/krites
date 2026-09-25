@@ -20,6 +20,10 @@ const tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(parent, "krites-plug
 // would be the built-in krites.dev one, so it is switched off here and a test that needs one passes its own.
 process.env.KRITES_CONFIG_DIR = path.join(tmp, "own-config");
 process.env.KRITES_PING_ENDPOINT = "off";
+// Children inherit these, so no run reads the developer's own user, project or managed settings.
+process.env.CLAUDE_CONFIG_DIR = fs.mkdtempSync(path.join(tmp, "claude-config-"));
+process.env.KRITES_MANAGED_SETTINGS_DIR = fs.mkdtempSync(path.join(tmp, "managed-settings-"));
+delete process.env.CLAUDE_PROJECT_DIR;
 
 const junctions = [];
 // Leftover processes are not killed here: by the end of a file a recorded pid may belong to something else,
@@ -69,6 +73,17 @@ function makeRepo({ files = {}, commit = true } = {}) {
 }
 
 const head = (dir) => git(dir, "rev-parse", "HEAD").stdout.toString().trim();
+
+// An in-process gate also gates the repo of the process cwd, so it runs from the temp dir, never the checkout.
+async function fromTmp(run) {
+  const cwd = process.cwd();
+  process.chdir(tmp);
+  try {
+    return await run();
+  } finally {
+    process.chdir(cwd);
+  }
+}
 
 // What session.js records at startup: the baseline HEAD and the hash of the config it read.
 function seed(root, gitRoot = root) {
@@ -123,9 +138,10 @@ function script(source) {
 
 const tomlString = (value) => `"${String(value).replace(/\\/g, "\\\\")}"`;
 
-function toml({ commands = [], timeoutSeconds, maxBlocks, globs } = {}) {
+function toml({ commands = [], slow, timeoutSeconds, maxBlocks, globs } = {}) {
   const argv = (item) => `[${item.map(tomlString).join(", ")}]`;
   const out = ["version = 1", "", "[checks]", `commands = [${commands.map(argv).join(", ")}]`];
+  if (slow !== undefined) out.push(`slow = [${slow.map(argv).join(", ")}]`);
   if (timeoutSeconds !== undefined) out.push(`timeout_seconds = ${timeoutSeconds}`);
   if (maxBlocks !== undefined) out.push(`max_blocks = ${maxBlocks}`);
   if (globs !== undefined) out.push("", "[protect]", `globs = [${globs.map(tomlString).join(", ")}]`);
@@ -205,6 +221,7 @@ module.exports = {
   assertBlock,
   configure,
   fixtureRepo,
+  fromTmp,
   git,
   gitInit,
   head,
