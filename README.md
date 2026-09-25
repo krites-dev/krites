@@ -52,9 +52,9 @@ krites  receipts/2026-09-25T16-11-37Z-382ebfd1.json
         receipts/2026-09-25T16-11-37Z-382ebfd1.md
 ```
 
-<a href=".github/assets/chip.mp4"><img alt="A circuit chip grows one crystal per check. The last check fails red and shrinks, regrows green, and a laser etches the receipt hash into the chip." src=".github/assets/chip.gif" width="440"></a>
+<a href=".github/assets/chip.mp4"><img alt="A circuit chip grows one crystal per check. The last check fails red and shrinks, then regrows green, while the chip turns slowly." src=".github/assets/chip.gif" width="440"></a>
 
-The How it works animation from the site: one crystal per check in the sample receipt, with a scripted failure on the last check before it passes. Click for the MP4.
+Adapted from the site's How it works animation: one crystal per check in the sample receipt, with a scripted failure on the last check before it passes. Click for the MP4.
 
 ## How it works
 

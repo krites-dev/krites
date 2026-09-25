@@ -1,6 +1,6 @@
 {
   "name": "krites",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Requires Node 20 or later. Protects judge files from the edit tools and gates the stop on the repo's own checks.",
   "author": {
     "name": "Quinn Lott",
