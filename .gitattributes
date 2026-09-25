@@ -1,1 +1,4 @@
 * text=auto eol=lf
+# Signed receipt bytes: a changed line ending breaks the signature. One line for this layout, one for the public mirror's.
+plugin/examples/receipts/*.json -text
+examples/receipts/*.json -text
