@@ -1,5 +1,6 @@
 const assert = require("node:assert");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const { test } = require("node:test");
 
@@ -234,4 +235,246 @@ test("protect: a colon in the relative path denies on Windows", async () => {
   if (!WINDOWS) return;
   const repo = makeRepo({ files: { "krites.toml": CONFIG } });
   assertDeny(await runHook(PROTECT, edit({ file_path: `${path.join(repo, "a.txt")}:stream` }, repo)), /a\.txt:stream/);
+});
+
+const slash = (file) => file.replace(/\\/g, "/");
+const allowing = (...globs) => `[protect]\nallow_outside = [${globs.map((glob) => JSON.stringify(glob)).join(", ")}]\n`;
+
+// decide() reads the user config and the home directory from the environment on every call.
+function withEnv(env, fn) {
+  const saved = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  try {
+    return fn();
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+const withUserConfig = (text, fn) => withEnv({ KRITES_CONFIG_DIR: makeDir(text === null ? {} : { "config.toml": text }) }, fn);
+
+test("protect: allow_outside in the user config opens its globs outside the repo and nothing else", () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  const work = makeDir({ "keep.md": "" });
+  const other = makeDir();
+
+  withUserConfig(allowing(`${slash(work)}/**`), () => {
+    assert.strictEqual(decide(input(path.join(work, "keep.md")), roots), null);
+    assert.strictEqual(decide(input(path.join(work, "new", "deep", "plan.md")), roots), null);
+    assert.strictEqual(decide(input(path.join(repo, "src", "lib.rs")), roots), null);
+    assert.match(decide(input(path.join(other, "x.md")), roots), /outside the repository/);
+    assert.match(decide(input(work), roots), /outside the repository/, "the glob opens what is under the folder, not the folder");
+    assert.match(decide(input(path.join(repo, "tests", "krites", "x.rs")), roots), /is protected/, "the repo's own globs still decide inside it");
+  });
+  withUserConfig(null, () => assert.match(decide(input(path.join(work, "keep.md")), roots), /outside the repository/));
+});
+
+test("protect: a link from an allowed folder to a target outside every glob is denied", () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  const work = makeDir();
+  const away = makeDir();
+  fs.symlinkSync(away, path.join(work, "away"), "junction");
+
+  withUserConfig(allowing(`${slash(work)}/**`), () => {
+    assert.match(decide(input(path.join(work, "away", "x.md")), roots), /outside the repository/);
+  });
+
+  const base = makeDir({ "keys/config.toml": allowing(`${slash(work)}/**`) });
+  const keys = path.join(base, "keys");
+  fs.writeFileSync(path.join(keys, "config.toml"), allowing(`${slash(base)}/**`, `${slash(work)}/**`));
+  fs.symlinkSync(keys, path.join(work, "keys"), "junction");
+  withEnv({ KRITES_CONFIG_DIR: keys }, () => {
+    assert.strictEqual(decide(input(path.join(base, "notes.md")), roots), null);
+    for (const denied of [path.join(keys, "config.toml"), path.join(work, "keys", "config.toml"), path.join(work, "keys", "signing-key.pem")]) {
+      assert.match(decide(input(denied), roots), /own configuration, which allow_outside never opens/, denied);
+    }
+  });
+});
+
+test("protect: allow_outside follows the file system's case and trailing-dot rules", () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  const home = makeDir({ "work/keep.md": "", ".config/krites/config.toml": allowing("~/**") });
+  const folds = WINDOWS || process.platform === "darwin";
+  withEnv({ HOME: home, USERPROFILE: home, KRITES_CONFIG_DIR: path.join(home, ".config", "krites") }, () => {
+    const key = path.join(home, ".config", "KRITES", "signing-key.pem");
+    const settings = path.join(home, ".CLAUDE", "settings.json");
+    for (const denied of [key, settings]) assert.match(decide(input(denied), roots), /own configuration/, `${denied}: closed in any case, on any file system`);
+  });
+  withUserConfig(allowing(`${slash(home)}/work/**`), () => {
+    const upper = decide(input(path.join(home, "WORK", "x.md")), roots);
+    const dotted = decide(input(path.join(home, "work.", "x.md")), roots);
+    if (folds) assert.strictEqual(upper, null);
+    else assert.match(upper, /outside the repository/);
+    if (WINDOWS) assert.strictEqual(dotted, null, "Win32 drops the trailing dot, so work. is work");
+    else assert.match(dotted, /outside the repository/, "work. is its own folder");
+  });
+});
+
+test("protect: a user config that cannot be read denies every outside write", () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  const keys = makeDir({ "config.toml/inside.txt": "" });
+  withEnv({ KRITES_CONFIG_DIR: keys }, () => {
+    assert.match(decide(input(path.join(makeDir(), "x.md")), roots), /config\.toml in the Krites config directory could not be read \(E[A-Z]+\)/);
+  });
+});
+
+test("protect: allow_outside = [\"~/**\"] still denies the signing key, the user config and ~/.claude", () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  const home = makeDir({ ".claude/settings.json": "{}\n", ".config/krites/config.toml": allowing("~/**") });
+  const project = path.join(home, ".claude", "projects", "D--work-repo");
+  fs.mkdirSync(path.join(project, "memory"), { recursive: true });
+  const transcript = path.join(project, "3f2b8c1e-9a4d-4e7b-8c21-5d6f7a8b9c0d.jsonl");
+  fs.writeFileSync(transcript, "");
+  const env = { HOME: home, USERPROFILE: home, KRITES_CONFIG_DIR: path.join(home, ".config", "krites") };
+
+  withEnv(env, () => {
+    assert.strictEqual(os.homedir(), home, "the home directory comes from the environment");
+    assert.strictEqual(decide(input(path.join(home, "notes", "x.md")), roots), null);
+    for (const denied of [
+      path.join(home, ".config", "krites", "signing-key.pem"),
+      path.join(home, ".config", "krites", "config.toml"),
+      path.join(home, ".claude", "settings.json"),
+      path.join(home, ".claude", "CLAUDE.md"),
+      path.join(home, ".claude"),
+      ...(WINDOWS ? [path.join(home, ".claude.", "settings.json"), path.join(home, ".claude ", "settings.json")] : []),
+    ]) {
+      assert.match(decide(input(denied), roots), /Claude Code's or Krites's own configuration/, denied);
+    }
+    assert.strictEqual(
+      decide({ transcript_path: transcript, tool_input: { file_path: path.join(project, "memory", "note.md") } }, roots),
+      null,
+      "the project memory folder keeps its own exception",
+    );
+  });
+});
+
+test("protect: allow_outside = [\"~/**\"] still denies ~/.claude.json itself, and only that file", () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  const home = makeDir({ ".claude.json": "{}\n", ".config/krites/config.toml": allowing("~/**") });
+  const env = { HOME: home, USERPROFILE: home, KRITES_CONFIG_DIR: path.join(home, ".config", "krites"), CLAUDE_CONFIG_DIR: undefined };
+
+  withEnv(env, () => {
+    for (const denied of [
+      path.join(home, ".claude.json"),
+      path.join(home, ".CLAUDE.JSON"),
+      path.join(home, ".claude-custom-oauth.json"),
+      ...(WINDOWS ? [path.join(home, ".claude.json.")] : []),
+    ]) {
+      assert.match(decide(input(denied), roots), /Claude Code's or Krites's own configuration/, denied);
+    }
+    assert.strictEqual(decide(input(path.join(home, ".claude.json.bak")), roots), null, "an exact match, not a prefix");
+  });
+
+  if (WINDOWS) return;
+  const linked = makeDir({ "dotfiles/claude.json": "{}\n", ".config/krites/config.toml": allowing("~/**") });
+  fs.symlinkSync(path.join(linked, "dotfiles", "claude.json"), path.join(linked, ".claude.json"));
+  withEnv({ ...env, HOME: linked, USERPROFILE: linked, KRITES_CONFIG_DIR: path.join(linked, ".config", "krites") }, () => {
+    assert.match(decide(input(path.join(linked, "dotfiles", "claude.json")), roots), /own configuration/, "the real path of a linked ~/.claude.json");
+  });
+});
+
+test("protect: $CLAUDE_CONFIG_DIR is closed while it is set, inside home or out", () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  const home = makeDir({ "claude-alt/settings.json": "{}\n", ".config/krites/config.toml": allowing("~/**") });
+  const alt = path.join(home, "claude-alt");
+  const away = makeDir({ "settings.json": "{}\n" });
+  const env = { HOME: home, USERPROFILE: home, KRITES_CONFIG_DIR: path.join(home, ".config", "krites") };
+
+  withEnv({ ...env, CLAUDE_CONFIG_DIR: alt }, () => {
+    assert.match(decide(input(path.join(alt, "settings.json")), roots), /Claude Code's or Krites's own configuration/);
+    assert.match(decide(input(alt), roots), /own configuration/);
+  });
+  fs.writeFileSync(path.join(home, ".config", "krites", "config.toml"), allowing("~/**", `${slash(away)}/**`));
+  withEnv({ ...env, CLAUDE_CONFIG_DIR: away }, () => {
+    assert.match(decide(input(path.join(away, "settings.json")), roots), /own configuration/, "an allow_outside glob covering it opens nothing");
+  });
+  for (const unset of [undefined, ""]) {
+    withEnv({ ...env, CLAUDE_CONFIG_DIR: unset }, () => {
+      assert.strictEqual(decide(input(path.join(alt, "settings.json")), roots), null, `CLAUDE_CONFIG_DIR=${JSON.stringify(unset)}`);
+    });
+  }
+  withEnv({ ...env, CLAUDE_CONFIG_DIR: "claude-alt", CLAUDE_PROJECT_DIR: home }, () => {
+    assert.match(decide(input(path.join(alt, "settings.json")), roots), /own configuration/, "a relative value, from the project dir");
+  });
+  const cwd = process.cwd();
+  process.chdir(home);
+  try {
+    withEnv({ ...env, CLAUDE_CONFIG_DIR: "claude-alt", CLAUDE_PROJECT_DIR: undefined }, () => {
+      assert.match(decide(input(path.join(alt, "settings.json")), roots), /own configuration/, "a relative value, from the cwd");
+    });
+  } finally {
+    process.chdir(cwd);
+  }
+});
+
+test("protect: an empty $CLAUDE_CONFIG_DIR is unset, so ~/.claude stays closed and the cwd stays open", () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  const home = makeDir({ ".claude/x": "x\n", "work/y.txt": "y\n", ".config/krites/config.toml": allowing("~/**") });
+  const env = { HOME: home, USERPROFILE: home, KRITES_CONFIG_DIR: path.join(home, ".config", "krites"), CLAUDE_CONFIG_DIR: "" };
+  const cwd = process.cwd();
+  process.chdir(path.join(home, "work"));
+  try {
+    withEnv({ ...env, CLAUDE_PROJECT_DIR: path.join(home, "work") }, () => {
+      assert.match(decide(input(path.join(home, ".claude", "x")), roots), /own configuration/);
+      assert.strictEqual(decide(input(path.join(home, "work", "y.txt")), roots), null, "the cwd is not a Claude config dir");
+    });
+  } finally {
+    process.chdir(cwd);
+  }
+});
+
+test("protect: a $CLAUDE_CONFIG_DIR written with trailing dots or spaces is closed as the folder Windows opens", { skip: !WINDOWS }, () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  const home = makeDir({ "claude-alt/settings.json": "{}\n", ".config/krites/config.toml": allowing("~/**") });
+  const env = { HOME: home, USERPROFILE: home, KRITES_CONFIG_DIR: path.join(home, ".config", "krites") };
+  fs.mkdirSync(path.join(home, "claude-dot."));
+  for (const [value, target] of [
+    [path.join(home, "claude-alt."), path.join(home, "claude-alt", "settings.json")],
+    [path.join(home, "claude-alt "), path.join(home, "claude-alt", "settings.json")],
+    [path.join(home, "claude-dot."), path.join(home, "claude-dot.", "settings.json")],
+  ]) {
+    withEnv({ ...env, CLAUDE_CONFIG_DIR: value }, () => {
+      assert.match(decide(input(target), roots), /own configuration/, JSON.stringify(value));
+    });
+  }
+});
+
+test("protect: a user config that does not load denies every outside write with its line and key, and no edit inside the repo", () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  const work = makeDir();
+  withUserConfig(allowing(`${slash(work)}/**`, "relative/**"), () => {
+    const reason = decide(input(path.join(work, "x.md")), roots);
+    assert.match(reason, /config\.toml in the Krites config directory, line 2: protect\.allow_outside entries are absolute paths or start with ~\//);
+    assert.doesNotMatch(reason, ABSOLUTE);
+    assert.strictEqual(decide(input(path.join(repo, "src", "lib.rs")), roots), null);
+  });
+});
+
+test("protect: on Windows allow_outside matches a target on another drive by its drive letter", () => {
+  if (!WINDOWS) return;
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  const drive = repo[0].toUpperCase() === "Q" ? "R" : "Q";
+  withUserConfig(allowing(`${drive.toLowerCase()}:/Elsewhere/**`), () => {
+    assert.strictEqual(decide(input(`${drive}:\\elsewhere\\x.txt`), roots), null);
+    assert.match(decide(input(`${drive}:\\other\\x.txt`), roots), /outside the repository/);
+    assert.match(decide(input(`${drive}:\\elsewhere\\x.txt:s`), roots), /alternate data stream/);
+    assert.strictEqual(decide(input(`${drive}:\\elsewhere.\\x.txt`), roots), null, "Win32 drops the trailing dot, so the write lands in the allowed folder");
+  });
 });

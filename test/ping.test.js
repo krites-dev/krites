@@ -8,7 +8,7 @@ const { after, test } = require("node:test");
 const gate = require("../hooks/gate.js");
 const ping = require("../lib/ping.js");
 const sign = require("../lib/sign.js");
-const { assertBlock, configure, makeRepo, runCli, runHook, script, seed, tmp } = require("./helpers.js");
+const { assertBlock, configure, fromTmp, makeRepo, runCli, runHook, script, seed, tmp } = require("./helpers.js");
 
 const VERSION = require("../.claude-plugin/plugin.json").version;
 const GATE = path.join(__dirname, "..", "hooks", "gate.js");
@@ -212,7 +212,7 @@ test("ping: an allowed stop pings once, and a hung endpoint changes nothing abou
   assert.ok(elapsed < 15000, `the hook waits for the cap and no longer (${elapsed} ms)`);
 });
 
-test("ping: a run that has used up its budget does not ping", async () => {
+async function spentBudget() {
   granted();
   const sink = await listen();
   const repo = makeRepo({ files: { "a.txt": "a\n" } });
@@ -222,16 +222,39 @@ test("ping: a run that has used up its budget does not ping", async () => {
   process.env.KRITES_PING_ENDPOINT = sink.url;
 
   try {
-    assert.strictEqual(await gate.gate(stop(repo), { totalMs: 4000, startedAt: Date.now() - 5000, projectDir: repo }), null);
+    assert.strictEqual(await fromTmp(() => gate.gate(stop(repo), { totalMs: 4000, startedAt: Date.now() - 5000, projectDir: repo })), null);
     assert.deepStrictEqual(sink.seen, [], "a run already past its budget has no 2 s to spare");
     assert.strictEqual(stored().last_attempt_at, null);
 
-    assert.strictEqual(await gate.gate(stop(repo), { projectDir: repo }), null);
+    assert.strictEqual(await fromTmp(() => gate.gate(stop(repo), { projectDir: repo })), null);
     assert.strictEqual(sink.seen.length, 1, "the same stop inside the budget pings");
   } finally {
     if (saved === undefined) delete process.env.KRITES_PING_ENDPOINT;
     else process.env.KRITES_PING_ENDPOINT = saved;
   }
+}
+
+test("ping: a run that has used up its budget does not ping", spentBudget);
+
+test("ping: the budget case leaves the repo the suite is run from alone", async () => {
+  const parent = makeRepo({ files: { "a.txt": "a\n" } });
+  configure(parent, { commands: [script("process.exit(0)")] });
+  seed(parent);
+  fs.writeFileSync(path.join(parent, "a.txt"), "changed\n");
+  const state = () => fs.readdirSync(path.join(parent, ".krites")).map((name) => [name, fs.readFileSync(path.join(parent, ".krites", name), "utf8")]);
+  const before = state();
+  const cwd = process.cwd();
+  let failure = null;
+  process.chdir(parent);
+  try {
+    await spentBudget();
+  } catch (error) {
+    failure = error;
+  } finally {
+    process.chdir(cwd);
+  }
+  assert.deepStrictEqual(state(), before, "the enclosing repo's .krites is not written");
+  if (failure) throw failure;
 });
 
 test("ping: a test process that loads the helpers has the endpoint off and keeps its state under the temp directory", async () => {

@@ -367,3 +367,69 @@ test("verify: telemetry answers in one line while the endpoint is off", async ()
     assert.deepStrictEqual(lines, ["Telemetry is switched off: KRITES_PING_ENDPOINT is set to off, so nothing is asked and nothing is sent."], args.join(" "));
   }
 });
+
+test("verify: slow checks run after the commands, and only when every command passed", async () => {
+  const repo = repoWith([script("console.log('fast out')")], { slow: [script("console.log('slow out')")] });
+  const lines = printed(await runCli(["verify"], { cwd: repo }));
+  assert.deepStrictEqual(lines.filter((line) => !line.startsWith("node ")), ["fast out", "exit 0", "slow out", "exit 0"]);
+  const run = lastRun(repo);
+  assert.strictEqual(run.verdict, "passed");
+  assert.deepStrictEqual(run.checks.map((check) => check.exit_code), [0, 0]);
+  assert.strictEqual(run.slow.length, 1);
+
+  const marker = path.join(tmp, `slow-unreached${Date.now()}.txt`);
+  const failing = repoWith([script("process.exit(2)")], { slow: [script(`require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran");`)] });
+  const refuted = printed(await runCli(["verify"], { cwd: failing }));
+  assert.strictEqual(refuted[refuted.length - 1], "exit 2");
+  assert.strictEqual(fs.existsSync(marker), false, "a failing command means the slow check never starts");
+  assert.strictEqual(lastRun(failing).verdict, "refuted");
+});
+
+test("verify: each root gets one line naming the file and key, project settings coming from CLAUDE_PROJECT_DIR", async () => {
+  const outer = makeRepo({
+    files: {
+      "a.txt": "a\n",
+      ".claude/settings.json": JSON.stringify({ disableAllHooks: true }),
+      "inner/.claude/settings.json": JSON.stringify({ enabledPlugins: { "krites@krites": false } }),
+    },
+  });
+  const inner = path.join(outer, "inner");
+  fs.writeFileSync(path.join(inner, "krites.toml"), toml({ commands: [script("process.exit(0)")], timeoutSeconds: 60 }));
+  fs.writeFileSync(path.join(outer, "krites.toml"), toml({ commands: [script("process.exit(0)")], timeoutSeconds: 60 }));
+  git(outer, "add", "-A");
+  git(outer, "commit", "-q", "-m", "config");
+  seed(outer);
+  seed(inner, outer);
+  const OFF_LINE = "Krites hooks are off for this repo: .claude/settings.json sets disableAllHooks.";
+
+  const lines = printed(await runCli(["verify"], { cwd: inner, env: { CLAUDE_PROJECT_DIR: outer } }));
+  assert.deepStrictEqual(lines.filter((line) => line.startsWith("Krites hooks")), [OFF_LINE, OFF_LINE], "the inner root's own file is not read");
+  lines.forEach((line, at) => line === OFF_LINE && assert.strictEqual(lines[at - 1], "exit 0", "each line follows the checks of its root"));
+  assert.deepStrictEqual(lines.filter((line) => line.startsWith("## ")), ["## .", "## .."], lines.join("\n"));
+
+  const bare = makeRepo({ files: { "a.txt": "a\n" } });
+  configure(bare, { commands: [script("process.exit(0)")], timeoutSeconds: 60 });
+  seed(bare);
+  const clean = printed(await runCli(["verify"], { cwd: bare }));
+  assert.ok(!clean.some((line) => line.includes("Krites")), clean.join("\n"));
+});
+
+test("verify: a managed directory from KRITES_MANAGED_SETTINGS_DIR is read, allowManagedHooksOnly there is may-be", async () => {
+  const repo = repoWith([script("process.exit(0)")]);
+  const managed = (settings) => ({ KRITES_MANAGED_SETTINGS_DIR: makeDir({ "managed-settings.json": JSON.stringify(settings) }) });
+  const off = printed(await runCli(["verify"], { cwd: repo, env: managed({ disableAllHooks: true }) }));
+  assert.strictEqual(off[off.length - 1], "Krites hooks are off for this repo: managed-settings.json sets disableAllHooks.", off.join("\n"));
+  const may = printed(await runCli(["verify"], { cwd: repo, env: managed({ allowManagedHooksOnly: true }) }));
+  assert.strictEqual(may[may.length - 1], "Krites hooks may be disabled for this repo: managed-settings.json sets allowManagedHooksOnly.", may.join("\n"));
+  assert.strictEqual(lastRun(repo).verdict, "passed", "the checks still run and are recorded");
+});
+
+test("verify: a settings file that does not parse is named, and the others are still read", async () => {
+  const repo = repoWith([script("process.exit(0)")]);
+  const env = { CLAUDE_CONFIG_DIR: makeDir({ "settings.json": "{broken" }), KRITES_MANAGED_SETTINGS_DIR: makeDir({ "managed-settings.json": JSON.stringify({ disableAllHooks: true }) }) };
+  const lines = printed(await runCli(["verify"], { cwd: repo, env }));
+  assert.deepStrictEqual(lines.slice(-2), [
+    "Krites cannot read $CLAUDE_CONFIG_DIR/settings.json, so its hooks setting is unknown.",
+    "Krites hooks are off for this repo: managed-settings.json sets disableAllHooks.",
+  ]);
+});

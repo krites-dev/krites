@@ -9,7 +9,7 @@
   },
   "scripts": {
     "lint": "eslint .",
-    "test": "node --test test/bypass.test.js test/cli-receipt.test.js test/commands.test.js test/config.test.js test/deadline.test.js test/e2e.test.js test/fabricated.test.js test/gate.test.js test/glob.test.js test/inert.test.js test/init.test.js test/output.test.js test/ping.test.js test/protect.test.js test/receipt.test.js test/session.test.js test/state.test.js test/timeouts.test.js test/verify.test.js"
+    "test": "node --test test/bypass.test.js test/cli-receipt.test.js test/commands.test.js test/config.test.js test/deadline.test.js test/e2e.test.js test/fabricated.test.js test/gate.test.js test/glob.test.js test/inert.test.js test/init.test.js test/output.test.js test/ping.test.js test/protect.test.js test/receipt.test.js test/session.test.js test/settings.test.js test/state.test.js test/timeouts.test.js test/verify.test.js"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

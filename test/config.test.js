@@ -3,7 +3,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { test } = require("node:test");
 
-const { findRoots, loadConfig, parseToml, protectedGlobs } = require("../lib/config.js");
+const { findRoots, loadConfig, loadUserConfig, parseToml, protectedGlobs } = require("../lib/config.js");
 const { matches } = require("../lib/glob.js");
 const { git, gitInit, makeDir, makeRepo, tmp } = require("./helpers.js");
 
@@ -60,6 +60,8 @@ test("config: the brief's example parses to the expected object", () => {
         ["cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings"],
         ["cargo", "nextest", "run", "--workspace"],
       ],
+      slow: [],
+      env: Object.create(null),
       timeout_seconds: 600,
       max_blocks: 3,
     },
@@ -73,7 +75,7 @@ test("config: the defaults when only version is set", () => {
   assert.strictEqual(loaded.ok, true, loaded.error);
   assert.deepStrictEqual(loaded.config, {
     version: 1,
-    checks: { commands: [], timeout_seconds: 600, max_blocks: 3 },
+    checks: { commands: [], slow: [], env: Object.create(null), timeout_seconds: 600, max_blocks: 3 },
     protect: { globs: [] },
     receipts: { dir: "receipts" },
   });
@@ -330,4 +332,91 @@ test("findRoots: a krites.toml tracked at HEAD but missing from the tree is a co
   assert.strictEqual(roots.length, 1);
   assert.strictEqual(roots[0].root, repo);
   assert.match(roots[0].error, /tracked but missing/);
+});
+
+test("user config: allow_outside takes absolute and home globs on every OS, and a missing file is an empty list", () => {
+  assert.deepStrictEqual(loadUserConfig(makeDir()), { ok: true, allowOutside: [] });
+  const entries = ["~/work/**", "~\\notes\\**", "/srv/scratch/**", "\\\\share\\x\\**", "C:/Users/q/scratch/**", "d:\\plans\\**"];
+  const text = `[protect]\nallow_outside = [${entries.map((entry) => JSON.stringify(entry)).join(", ")}]\n`;
+  assert.deepStrictEqual(loadUserConfig(makeDir({ "config.toml": text })), { ok: true, allowOutside: entries });
+});
+
+test("user config: a relative entry and every other shape are errors that name the file, the line and the key", () => {
+  const cases = [
+    ['[protect]\nallow_outside = ["work/**"]\n', 2, /protect\.allow_outside entries are absolute paths or start with ~\//],
+    ['[protect]\nallow_outside = [\n  "~/a/**",\n  "~work/**",\n]\n', 4, /protect\.allow_outside entries/],
+    ['[protect]\nallow_outside = [""]\n', 2, /protect\.allow_outside is a list of non-empty strings/],
+    ['[protect]\nallow_outside = "~/work/**"\n', 2, /protect\.allow_outside is a list of non-empty strings/],
+    ['[protect]\nglobs = ["x"]\n', 2, /unknown key protect\.globs/],
+    ["[checks]\n", 1, /unknown table \[checks\]/],
+    ["version = 1\n", 1, /unknown key version/],
+  ];
+  for (const [text, line, what] of cases) {
+    const loaded = loadUserConfig(makeDir({ "config.toml": text }));
+    assert.strictEqual(loaded.ok, false, text);
+    assert.match(loaded.error, new RegExp(`^config\\.toml in the Krites config directory, line ${line}: `), text);
+    assert.match(loaded.error, what, text);
+  }
+});
+
+test("user config: krites.toml does not take allow_outside", () => {
+  const loaded = load('version = 1\n\n[protect]\nallow_outside = ["~/work/**"]\n');
+  assert.strictEqual(loaded.ok, false);
+  assert.match(loaded.error, /^krites\.toml line 4: unknown key protect\.allow_outside/);
+});
+
+test("config: [checks.env] is a table of names and string values", () => {
+  const loaded = load(head('[checks]\ncommands = ["make vulncheck"]\n\n[checks.env]\nGOTOOLCHAIN = "go1.26.6"\n__proto__ = "x"\n_Lower_9 = ""\n'));
+  assert.strictEqual(loaded.ok, true, loaded.error);
+  assert.deepStrictEqual(Object.entries(loaded.config.checks.env), [["GOTOOLCHAIN", "go1.26.6"], ["__proto__", "x"], ["_Lower_9", ""]]);
+  assert.deepStrictEqual(Object.entries(load(head("")).config.checks.env), []);
+});
+
+test("config: a bad [checks.env] is refused with its line", () => {
+  const cases = [
+    ['[checks.env]\n1X = "a"\n', 4, /a line is blank, a comment, a table header or key = value/],
+    ['[checks.env]\nA-B = "a"\n', 4, /\[checks\.env\] names are letters, digits and _, not starting with a digit/],
+    ["[checks.env]\nA = 1\n", 4, /\[checks\.env\] values are strings/],
+    ['[checks.env]\nA = ["x"]\n', 4, /\[checks\.env\] values are strings/],
+    ['[checks.env]\nA = "a\tb"\n', 4, /\[checks\.env\] values may not hold a control character/],
+    ...['\\"', "&", "|", "<", ">", "^", "%", "!"].map((ch) => [`[checks.env]\nA = "x${ch}y"\n`, 4, /\[checks\.env\] values may not hold the character/]),
+    ['[checks.env]\nPath = "a"\nPATH = "b"\n', 5, /\[checks\.env\] names PATH twice, ignoring case/],
+    ['[checks.env]\nA = "a"\n\n[checks.env]\n', 6, /\[checks\.env\] appears twice/],
+    ["[checks.other]\n", 3, /unknown table \[checks\.other\]/],
+    ["[protect.env]\n", 3, /unknown table \[protect\.env\]/],
+    ["[checks.env.x]\n", 3, /a table header is/],
+    ['[checks]\nenv = "A=1"\n', 4, /unknown key checks\.env/],
+  ];
+  for (const [body, line, what] of cases) {
+    const loaded = load(head(body));
+    assert.strictEqual(loaded.ok, false, body);
+    assert.match(loaded.error, new RegExp(`^krites\\.toml line ${line}: `), `${body}: ${loaded.error}`);
+    assert.match(loaded.error, what, body);
+  }
+});
+
+test("config: changing [checks.env] changes config_hash", () => {
+  const a = load(head('[checks.env]\nGOTOOLCHAIN = "go1.26.6"\n'));
+  const b = load(head('[checks.env]\nGOTOOLCHAIN = "go1.26.7"\n'));
+  assert.ok(a.ok && b.ok);
+  assert.notStrictEqual(a.hash, b.hash);
+});
+
+test("config: [checks].slow is validated like commands and defaults to none", () => {
+  const loaded = load(head('[checks]\ncommands = ["cargo test"]\nslow = [\n  "cargo test --release",\n  ["pnpm", "e2e"],\n]\n'));
+  assert.strictEqual(loaded.ok, true, loaded.error);
+  assert.deepStrictEqual(loaded.config.checks.slow, [["cargo", "test", "--release"], ["pnpm", "e2e"]]);
+  assert.deepStrictEqual(load(head('[checks]\ncommands = ["cargo test"]\n')).config.checks.slow, []);
+
+  const cases = [
+    ['[checks]\nslow = [\n  "ok",\n  "a | b",\n]\n', 6, /may not hold the character "\|"/],
+    ['[checks]\nslow = ["-x"]\n', 4, /starting with - has no program/],
+    ['[checks]\nslow = "cargo test"\n', 4, /checks\.slow is a list of commands/],
+  ];
+  for (const [body, line, what] of cases) {
+    const bad = load(head(body));
+    assert.strictEqual(bad.ok, false, body);
+    assert.match(bad.error, new RegExp(`^krites\\.toml line ${line}: `), `${body}: ${bad.error}`);
+    assert.match(bad.error, what, body);
+  }
 });

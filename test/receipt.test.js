@@ -207,6 +207,12 @@ const FORGED = [
   ["a diff count that is not a whole number", (run) => ({ ...run, diff: { ...run.diff, insertions: 1.5 } })],
   ["insertions in a diff that changed no file", (run) => ({ ...run, diff: { files_changed: 0, files: [], insertions: 500, deletions: 0 } })],
   ["a file listed twice", (run) => ({ ...run, diff: { ...run.diff, files_changed: 2, files: ["a.txt", "a.txt"] } })],
+  ["slow commands that are not arrays of strings", (run) => ({ ...run, slow: ["cargo test"] })],
+  ["an env that is not a list of strings", (run) => ({ ...run, env: [5] })],
+  ["passed with a slow check that has no exit code", (run) => ({ ...run, slow: [["slow"]], checks: [...run.checks, { ...run.checks[0], exit_code: null }] })],
+  ["more checks than commands and slow together", (run) => ({ ...run, slow: [["slow"]], checks: [run.checks[0], run.checks[0], run.checks[0]] })],
+  ["passed with only some of the slow checks run", (run) => ({ ...run, slow: [["b"], ["c"]], checks: [run.checks[0], run.checks[0]] })],
+  ["no_checks with a slow check that ran",(run) => ({ ...run, verdict: "no_checks", commands: [], slow: [["slow"]] })],
 ];
 
 // Every shape the gate and /krites:verify really write, so tightening gateWrote cannot refuse a true run.
@@ -249,6 +255,16 @@ async function realRuns() {
   seed(emptied);
   await runCli(["verify"], { cwd: emptied });
 
+  const slowRan = makeRepo({ files: { "a.txt": "a\n" } });
+  configure(slowRan, { commands: [script("process.exit(0)")], slow: [script("process.exit(0)")], timeoutSeconds: 60 });
+  seed(slowRan);
+  await runCli(["verify"], { cwd: slowRan });
+
+  const onlySlow = makeRepo({ files: { "a.txt": "a\n" } });
+  configure(onlySlow, { commands: [], slow: [script("process.exit(0)")], timeoutSeconds: 60 });
+  seed(onlySlow);
+  await runCli(["verify"], { cwd: onlySlow });
+
   return [
     ["passed, from the gate", await ran({ commands: [script("console.log('fine')")] }), "passed"],
     ["refuted by a check", await ran({ commands: [script("console.log('boom'); process.exit(1)")] }), "refuted"],
@@ -261,6 +277,10 @@ async function realRuns() {
     ["a payload with no session id", noId, "passed"],
     ["refuted under /krites:verify", verified, "refuted"],
     ["no_checks under /krites:verify", emptied, "no_checks"],
+    ["passed at a stop with a slow check not run", await ran({ commands: [script("process.exit(0)")], slow: [script("process.exit(0)")] }), "passed"],
+    ["no_checks at a stop with only a slow check", await ran({ commands: [], slow: [script("process.exit(0)")] }), "no_checks"],
+    ["passed under /krites:verify with the slow check", slowRan, "passed"],
+    ["passed under /krites:verify with only a slow check", onlySlow, "passed"],
   ];
 }
 
@@ -353,7 +373,7 @@ test("receipt: a run signed right after the gate verifies, and a second export i
   const built = receipts.build(repo);
   assert.strictEqual(built.ok, true, built.reason);
   const run = JSON.parse(fs.readFileSync(path.join(repo, LAST_RUN), "utf8"));
-  assert.strictEqual(built.receipt.schema, "krites.receipt/0.2");
+  assert.strictEqual(built.receipt.schema, "krites.receipt/0.3");
   assert.strictEqual(built.receipt.verdict, "passed");
   assert.strictEqual(built.receipt.created_at, run.created_at);
   assert.strictEqual(built.receipt.tree_fingerprint, run.fingerprint, "the tree state the gate recorded");
@@ -482,4 +502,143 @@ test("receipt: a krites.receipt/0.1 receipt still verifies, pinned to the key th
 
 test("receipt: nothing was written under the real user config directory", () => {
   assert.strictEqual(listing(REAL), REAL_BEFORE, "the tests write only under the OS temp directory");
+});
+
+test("receipt: every configured check that did not run is listed as not run", async () => {
+  const slow = script("process.exit(0)");
+  const stopped = await ran({ commands: [script("process.exit(0)")], slow: [slow] });
+  const built = receipts.build(stopped);
+  assert.strictEqual(built.ok, true, built.reason);
+  assert.strictEqual(built.receipt.verdict, "passed");
+  assert.deepStrictEqual(built.receipt.not_run, [built.receipt.slow[0].join(" ")]);
+  assert.strictEqual(built.receipt.checks.length, 1);
+  const where = receipts.write(stopped, built.receipt, DIR);
+  assert.strictEqual(verifier.check(fs.readFileSync(path.join(stopped, where.json)), null).ok, true);
+  const md = fs.readFileSync(path.join(stopped, where.md), "utf8");
+  assert.match(md, /\| `node [^|`]*check\d+\.js` \| not run \| \|\n/);
+  assert.match(md, /\nEnv: none\n/);
+
+  const verified = makeRepo({ files: { "a.txt": "a\n" } });
+  configure(verified, { commands: [script("process.exit(0)")], slow: [slow], timeoutSeconds: 60 });
+  seed(verified);
+  await runCli(["verify"], { cwd: verified });
+  assert.deepStrictEqual(receipts.build(verified).receipt.not_run, []);
+
+  const refuted = await ran({ commands: [script("process.exit(1)"), script("process.exit(0)")], slow: [slow] });
+  const failed = receipts.build(refuted).receipt;
+  assert.strictEqual(failed.verdict, "refuted");
+  assert.deepStrictEqual(failed.not_run, [failed.commands[1].join(" "), failed.slow[0].join(" ")]);
+});
+
+test("receipt: env comes from the run file scrubbed, and a run file without it signs with none", async () => {
+  const repo = await ran({ commands: [script("process.exit(0)")] });
+  const file = path.join(repo, LAST_RUN);
+  const run = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.deepStrictEqual(receipts.build(repo).receipt.env, []);
+
+  fs.writeFileSync(file, `${JSON.stringify(without(without(run, "env"), "slow"), null, 2)}\n`);
+  const older = receipts.build(repo);
+  assert.strictEqual(older.ok, true, older.reason);
+  assert.deepStrictEqual([older.receipt.env, older.receipt.slow, older.receipt.not_run], [[], [], []]);
+
+  fs.writeFileSync(file, `${JSON.stringify({ ...run, env: ["GOTOOLCHAIN=go1.26.6", "API_TOKEN=sk-abcdefghijklmnopqrstuvwxyz0123"] }, null, 2)}\n`);
+  const built = receipts.build(repo);
+  assert.deepStrictEqual(built.receipt.env, ["GOTOOLCHAIN=go1.26.6", "API_TOKEN=<redacted>"]);
+  const where = receipts.write(repo, built.receipt, DIR);
+  assert.match(fs.readFileSync(path.join(repo, where.md), "utf8"), /\nEnv: `GOTOOLCHAIN=go1\.26\.6`\nEnv: `API_TOKEN=<redacted>`\n/);
+});
+
+const rendered = (fields) => {
+  const receipt = {
+    verdict: "failed",
+    reason: null,
+    checks: [],
+    not_run: [],
+    env: [],
+    diff: { files_changed: 0, insertions: 0, deletions: 0 },
+    repo: { head: "abcdef0123" },
+    created_at: "2026-09-24T00:00:00Z",
+    config_hash: "c",
+    signature: { public_key: "AAAA" },
+    ...fields,
+  };
+  return fs.readFileSync(path.join(tmp, receipts.write(tmp, receipt, "md-escape").md), "utf8");
+};
+const rowsOf = (md) => md.split("\n").filter((line) => line.startsWith("|")).slice(2);
+
+test("receipt: run content cannot break the Markdown table or add lines", () => {
+  const md = rendered({
+    checks: [{ command: "echo a|b\n# x ```y", exit_code: 1, duration_ms: 5 }],
+    not_run: ["`tick`"],
+    env: ["A=1,2", "B=3|4"],
+  });
+  assert.deepStrictEqual(rowsOf(md), ["| ````echo a\\|b # x ```y```` | 1 | 5 |", "| `` `tick` `` | not run | |"]);
+  assert.match(md, /\nConfig hash: `c`\nEnv: `A=1,2`\nEnv: `B=3\|4`\n/, "no cell escape outside the table");
+});
+
+test("receipt: the Markdown reason is its first line only, in a code span", () => {
+  const md = rendered({ reason: "Krites refuted the stop: npm test\n| fake | row |\nVerdict: passed\n<img src=x>" });
+  assert.match(md, /\nReason: `Krites refuted the stop: npm test`\n\n/);
+  assert.doesNotMatch(md, /fake|<img/);
+  assert.strictEqual(md.match(/^Verdict:/gm).length, 1);
+  assert.deepStrictEqual(rowsOf(md), ["| none ran | | |"]);
+  assert.match(rendered({}), /\nReason: none\n/);
+});
+
+test("receipt: code spans survive edge backticks, empty text and every control character", () => {
+  const cases = {
+    "a`": "`` a` ``",
+    "```": "```` ``` ````",
+    "": "` `",
+    "a\rb\tc\x7fd\x85e\x9ff\u2028g\u2029h": "`a b c d e f g h`",
+  };
+  const md = rendered({ not_run: Object.keys(cases) });
+  assert.deepStrictEqual(rowsOf(md), Object.values(cases).map((span) => `| ${span} | not run | |`));
+});
+
+test("receipt: a stop on the tree /krites:verify passed has nothing not run, and an edit in between lists slow", async () => {
+  const repo = makeRepo({ files: { "a.txt": "a\n" } });
+  configure(repo, { commands: [script("process.exit(0)")], slow: [script("process.exit(0)")], timeoutSeconds: 60 });
+  seed(repo);
+  fs.writeFileSync(path.join(repo, "a.txt"), "changed\n");
+  await runCli(["verify"], { cwd: repo });
+  const verified = receipts.build(repo).receipt;
+  await runHook(GATE, stop(repo), { cwd: repo });
+  const carried = receipts.build(repo);
+  assert.strictEqual(carried.ok, true, carried.reason);
+  assert.deepStrictEqual(carried.receipt.not_run, []);
+  assert.deepStrictEqual(carried.receipt.checks.slice(1), verified.checks.slice(1));
+
+  await runCli(["verify"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "a.txt"), "edited again\n");
+  await runHook(GATE, stop(repo), { cwd: repo });
+  const edited = receipts.build(repo).receipt;
+  assert.deepStrictEqual(edited.not_run, [edited.slow[0].join(" ")]);
+});
+
+test("receipt: only a passed verify run with every check whole and at exit 0 is carried into a stop", async () => {
+  const repo = makeRepo({ files: { "a.txt": "a\n" } });
+  configure(repo, { commands: [script("process.exit(0)")], slow: [script("process.exit(0)")], timeoutSeconds: 60 });
+  seed(repo);
+  fs.writeFileSync(path.join(repo, "a.txt"), "changed\n");
+  await runCli(["verify"], { cwd: repo });
+  const file = path.join(repo, LAST_RUN);
+  const verified = JSON.parse(fs.readFileSync(file, "utf8"));
+  const [first, second] = verified.checks;
+  const cases = [
+    ["a timed-out slow check", { checks: [first, { ...second, exit_code: null }] }],
+    ["a slow check without duration_ms", { checks: [first, without(second, "duration_ms")] }],
+    ["a slow check with an extra key", { checks: [first, { ...second, extra: 1 }] }],
+    ["a slow check with a text duration", { checks: [first, { ...second, duration_ms: "5" }] }],
+    ["a failed command before the slow check", { checks: [{ ...first, exit_code: 1 }, second] }],
+    ["a run that is not passed", { verdict: "refuted", reason: "no" }],
+  ];
+  for (const [name, change] of cases) {
+    fs.writeFileSync(file, `${JSON.stringify({ ...verified, ...change }, null, 2)}\n`);
+    await runHook(GATE, stop(repo), { cwd: repo });
+    const built = receipts.build(repo);
+    assert.strictEqual(built.ok, true, `${name}: ${built.reason}`);
+    assert.strictEqual(built.receipt.checks.length, 1, name);
+    assert.deepStrictEqual(built.receipt.not_run, [built.receipt.slow[0].join(" ")], name);
+  }
 });
