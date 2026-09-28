@@ -246,7 +246,7 @@ test("output: scrub removes the path forms compilers print and redacts token sha
 test("output: scrub redacts DSN passwords and key=value secrets and leaves their look-alikes", () => {
   const root = WINDOWS ? "D:\\Work\\Krites" : "/usr/work/krites";
   const redacted = [
-    ["postgres://neil:hunter2@db:5432/app", "postgres://neil:<redacted>@db:5432/app"],
+    ["postgres://neil:hunter2@localhost:5432/app", "postgres://neil:<redacted>@localhost:5432/app"],
     ["DB_PASSWORD=hunter2", "DB_PASSWORD=<redacted>"],
     ['password: "a b"', "password: <redacted>"],
     ['{password="a b"}', "{password=<redacted>}"],
@@ -273,7 +273,7 @@ test("output: scrub redacts DSN passwords and key=value secrets and leaves their
 test("output: scrub redacts empty-user DSNs, env names, JSON keys, auth headers and spaced flags", () => {
   const root = WINDOWS ? "D:\\Work\\Krites" : "/usr/work/krites";
   const redacted = [
-    ["redis://:p4ss@cache:6379/0", "redis://:<redacted>@cache:6379/0"],
+    ["redis://:p4ss@localhost:6379/0", "redis://:<redacted>@localhost:6379/0"],
     ["AWS_SECRET_ACCESS_KEY=abc123", "AWS_SECRET_ACCESS_KEY=<redacted>"],
     ["DB_PASS=hunter2", "DB_PASS=<redacted>"],
     ["GITHUB_TOKEN_OLD=x1", "GITHUB_TOKEN_OLD=<redacted>"],
@@ -288,7 +288,7 @@ test("output: scrub redacts empty-user DSNs, env names, JSON keys, auth headers 
     ["authorization: Token abc123def", "authorization: Token <redacted>"],
     ['Proxy-Authorization: Digest username="u", response="abc"', "Proxy-Authorization: Digest <redacted>"],
     ["Authorization: Bearer abcdefghijklmnopqrst", "Authorization: <redacted>"],
-    ["mysql --password hunter2 -h db", "mysql --password <redacted> -h db"],
+    ["mysql --password hunter2 -h localhost", "mysql --password <redacted> -h localhost"],
     ["run --db-password 'a b' --verbose", "run --db-password <redacted> --verbose"],
     ["--api-key abc", "--api-key <redacted>"],
     ["--token xyz", "--token <redacted>"],
@@ -303,12 +303,12 @@ test("output: scrub redacts empty-user DSNs, env names, JSON keys, auth headers 
     ["{'Authorization': 'Basic dXNlcjpwYXNz'}", "{'Authorization': <redacted>"],
     ["DB_PASSWORD=p@ss;w0rd", "DB_PASSWORD=<redacted>"],
     ["DB_PASSWORD=a&b,c", "DB_PASSWORD=<redacted>"],
-    ["+ curl -u admin:hunter2 https://x", "+ curl -u admin:<redacted> https://x"],
-    ["curl --user admin:hunter2 https://x", "curl --user admin:<redacted> https://x"],
+    ["+ curl -u admin:hunter2 https://localhost", "+ curl -u admin:<redacted> https://localhost"],
+    ["curl --user admin:hunter2 https://localhost", "curl --user admin:<redacted> https://localhost"],
     ["--pass hunter2", "--pass <redacted>"],
     ['{:password => "hunter2"}', "{:password => <redacted>}"],
-    ["curl --user=admin:hunter2 https://x", "curl --user=admin:<redacted> https://x"],
-    ["curl -uadmin:hunter2 https://x", "curl -uadmin:<redacted> https://x"],
+    ["curl --user=admin:hunter2 https://localhost", "curl --user=admin:<redacted> https://localhost"],
+    ["curl -uadmin:hunter2 https://localhost", "curl -uadmin:<redacted> https://localhost"],
     ["DB_PASSWORD2=hunter2", "DB_PASSWORD2=<redacted>"],
     ["PASSPHRASE=hunter2", "PASSPHRASE=<redacted>"],
   ];
@@ -316,7 +316,7 @@ test("output: scrub redacts empty-user DSNs, env names, JSON keys, auth headers 
     assert.strictEqual(scrub(line, root), want, line);
     assert.strictEqual(scrub(scrub(line, root), root), want, `scrubbing ${line} twice changes nothing more`);
   }
-  const alike = ["max_tokens=1000", "pass: 42", "bypass=1", "compass: north", "http://localhost/path", "tests_passed: 3", "mysql -p hunter2", "--verbose --token-limit 5", "mysql --password -h db", "--bypass on", "test token_store::tests::loads ... ok", "test db_pass::tests::x ... ok", "pg_dump --no-password dbname", "items.map(token => token.trim())"];
+  const alike = ["max_tokens=1000", "pass: 42", "bypass=1", "compass: north", "http://localhost/path", "tests_passed: 3", "mysql -p hunter2", "--verbose --token-limit 5", "mysql --password -h localhost", "--bypass on", "test token_store::tests::loads ... ok", "test db_pass::tests::x ... ok", "pg_dump --no-password dbname", "items.map(token => token.trim())"];
   for (const line of alike) assert.strictEqual(scrub(line, root), line);
 });
 
@@ -340,14 +340,14 @@ test("output: scrub stays linear on long runs of scheme and key characters", () 
 
 test("output: a failing check that prints a DSN leaves its password in no sink", { timeout: 60000 }, async () => {
   const repo = makeRepo({ files: { "a.txt": "a\n" } });
-  const printer = 'console.log("connect postgres://neil:hunter2@db:5432/app"); console.log("DB_PASSWORD=hunter2");';
+  const printer = 'console.log("connect postgres://neil:hunter2@localhost:5432/app"); console.log("DB_PASSWORD=hunter2");';
   configure(repo, { commands: [script(`${printer} process.exit(1);`)], timeoutSeconds: 60 });
   seed(repo);
   fs.writeFileSync(path.join(repo, "a.txt"), "changed\n");
 
   const blocked = await runHook(hook("gate"), stop(repo), { cwd: repo });
   const reason = JSON.parse(blocked.stdout).reason;
-  assert.match(reason, /postgres:\/\/neil:<redacted>@db/);
+  assert.match(reason, /postgres:\/\/neil:<redacted>@localhost/);
   const gated = fs.readFileSync(path.join(repo, ".krites", "last-run.json"), "utf8");
   const verified = await runCli(["verify"], { cwd: repo });
   assert.match(verified.stdout, /DB_PASSWORD=<redacted>/);
