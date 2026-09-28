@@ -1,9 +1,8 @@
 ---
-description: Turn the weekly Krites ping on or off.
+description: Show whether the weekly Krites ping is on, off or not yet answered.
 allowed-tools: Bash(node "${CLAUDE_PLUGIN_ROOT}/cli.js":*)
-argument-hint: on|off
 disable-model-invocation: true
 ---
-!`node "${CLAUDE_PLUGIN_ROOT}/cli.js" telemetry $ARGUMENTS`
+!`node "${CLAUDE_PLUGIN_ROOT}/cli.js" telemetry`
 
 Reply with the output above exactly as printed and nothing else: no summary, no advice, no sentence of your own before or after it. Use no tool: do not open, read, run or change anything, including any file the output names.

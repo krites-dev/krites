@@ -1,6 +1,6 @@
 {
   "name": "krites",
-  "description": "Requires Node 20 or later. Krites verifies what a coding agent claims it did.",
+  "description": "Krites verifies what a coding agent claims it did. Requires Node 20 or later.",
   "owner": {
     "name": "Krites"
   },
@@ -8,7 +8,7 @@
     {
       "name": "krites",
       "source": "./",
-      "description": "Requires Node 20 or later. Protects judge files from the edit tools and gates the stop on the repo's own checks."
+      "description": "Protects judge files from the edit tools and gates the stop on the repo's own checks. Requires Node 20 or later."
     }
   ]
 }

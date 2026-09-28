@@ -31,7 +31,7 @@ const GLOBS = [
 const MARKERS = "Cargo.toml, package.json, pyproject.toml, pytest.ini or go.mod";
 const NO_CHECKS = "krites.toml configures no checks, so nothing ran.";
 const NO_ROOT = "This repo has no krites.toml, so Krites is checking nothing. Run /krites:init.";
-const USAGE = "usage: /krites:init [--write], /krites:verify, /krites:receipt, /krites:telemetry on|off";
+const USAGE = "usage: /krites:init, /krites:init-write, /krites:verify, /krites:receipt, /krites:telemetry, /krites:telemetry-on, /krites:telemetry-off";
 
 const lines = [];
 const say = (text, root) => lines.push(scrub(String(text), root));
@@ -162,7 +162,7 @@ function approve(root, write) {
   if (slow.length > 0) lines.push("and under /krites:verify only:", ...slow);
   if (env.length > 0) lines.push("with this environment:", ...env);
   say(lines.join("\n"), root);
-  if (!write) return say("Nothing was written. Run /krites:init --write to approve this krites.toml for the gate.", root);
+  if (!write) return say("Nothing was written. Run /krites:init-write to approve this krites.toml for the gate.", root);
   state.writeConfigHash(root, loaded.hash);
   say("The gate now accepts this krites.toml.", root);
 }
@@ -179,7 +179,7 @@ function init(args) {
   if (commands === null) return say(`No ${MARKERS} is here, so there is nothing to propose. Write krites.toml by hand.`, root);
   const text = proposal(commands, hookScripts(root));
   say(text.trimEnd(), root);
-  if (!write) return say("Nothing was written. Run /krites:init --write to create it.", root);
+  if (!write) return say("Nothing was written. Run /krites:init-write to create it.", root);
   fs.writeFileSync(path.join(root, "krites.toml"), text, { flag: "wx" });
   state.writeConfigHash(root, state.hashText(text));
   say("krites.toml is written and the gate accepts it. Run /krites:verify to run the checks now.", root);
@@ -271,7 +271,7 @@ function telemetry(args) {
   say(ping.telemetry(args[0]), process.cwd());
 }
 
-// $ARGUMENTS reaches the command line as the user typed it, so anything unknown is answered with the usage line
+// No command passes user text, but cli.js can be run by hand, so anything unknown is answered with the usage line
 // and nothing else, the consent question included.
 async function run(name, args, options) {
   if (name === "telemetry") {

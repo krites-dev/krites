@@ -124,7 +124,7 @@ test("ping: off is permanent across commands until on, which sends the first pin
   const repo = repoWith("console.log('ok')");
   const env = { KRITES_PING_ENDPOINT: sink.url };
 
-  assert.match((await runCli(["telemetry", "off"], { cwd: repo, env })).stdout, /Telemetry is off/);
+  assert.match((await runCli(["telemetry", "off"], { cwd: repo, env })).stdout, /Telemetry is off\. Nothing is sent\. Run \/krites:telemetry-on to allow it\./);
   for (const args of [["verify"], ["init"], ["telemetry"], ["receipt"]]) {
     const result = await runCli(args, { cwd: repo, env });
     assert.ok(!result.stdout.includes(ping.QUESTION), `${args.join(" ")} does not ask again`);
@@ -132,7 +132,7 @@ test("ping: off is permanent across commands until on, which sends the first pin
   assert.deepStrictEqual(sink.seen, [], "a declined install sends nothing");
   assert.strictEqual(stored().consent, "declined");
 
-  assert.match((await runCli(["telemetry", "on"], { cwd: repo, env })).stdout, /Telemetry is on/);
+  assert.match((await runCli(["telemetry", "on"], { cwd: repo, env })).stdout, /Telemetry is on: .* Run \/krites:telemetry-off to stop it\./);
   assert.strictEqual(sink.seen.length, 1, "on sends the first ping now");
   assert.strictEqual(stored().consent, "granted");
 

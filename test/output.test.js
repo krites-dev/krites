@@ -238,7 +238,7 @@ test("output: scrub removes the path forms compilers print and redacts token sha
     assert.ok(!clean.includes("someone") && !clean.includes("else"), `no part of the user name survives: ${line} -> ${clean}`);
   }
   if (WINDOWS) assert.ok(scrub("at /d/Other/secret/x.rs:9", root).endsWith("x.rs:9"), "an MSYS path keeps its file name only");
-  for (const line of ['expected "/api/v1/users" got "/api/v2/users"', "GET /api/v1/users 404", "see https://example.com/usr/docs/page", "sed s/foo/bar/g"]) {
+  for (const line of ['expected "/api/v1/users" got "/api/v2/users"', "GET /api/v1/users 404", "see http://localhost/usr/docs/page", "sed s/foo/bar/g"]) {
     assert.strictEqual(scrub(line, root), line);
   }
 });
@@ -261,7 +261,7 @@ test("output: scrub redacts DSN passwords and key=value secrets and leaves their
   const alike = [
     "pass: 42",
     "max_tokens=1000",
-    "https://example.com/path",
+    "http://localhost/path",
     "if (password == expected) {",
     "tokens.map(token => token.trim())",
     "token:\n  value",
@@ -316,7 +316,7 @@ test("output: scrub redacts empty-user DSNs, env names, JSON keys, auth headers 
     assert.strictEqual(scrub(line, root), want, line);
     assert.strictEqual(scrub(scrub(line, root), root), want, `scrubbing ${line} twice changes nothing more`);
   }
-  const alike = ["max_tokens=1000", "pass: 42", "bypass=1", "compass: north", "https://example.com/path", "tests_passed: 3", "mysql -p hunter2", "--verbose --token-limit 5", "mysql --password -h db", "--bypass on", "test token_store::tests::loads ... ok", "test db_pass::tests::x ... ok", "pg_dump --no-password dbname", "items.map(token => token.trim())"];
+  const alike = ["max_tokens=1000", "pass: 42", "bypass=1", "compass: north", "http://localhost/path", "tests_passed: 3", "mysql -p hunter2", "--verbose --token-limit 5", "mysql --password -h db", "--bypass on", "test token_store::tests::loads ... ok", "test db_pass::tests::x ... ok", "pg_dump --no-password dbname", "items.map(token => token.trim())"];
   for (const line of alike) assert.strictEqual(scrub(line, root), line);
 });
 

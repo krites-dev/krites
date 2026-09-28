@@ -16,10 +16,10 @@ claude plugin install krites@krites
 
 Requires Claude Code and Node 20 or later. Inside a session, `/plugin marketplace add krites-dev/krites` and `/plugin install krites@krites` do the same.
 
-- `/krites:init` shows the `krites.toml` it would write for this repo and the Node version it found. `/krites:init --write` creates it, or approves a `krites.toml` you edited yourself.
+- `/krites:init` shows the `krites.toml` it would write for this repo and the Node version it found. `/krites:init-write` creates it, or approves a `krites.toml` you edited yourself.
 - `/krites:verify` runs the configured checks now and prints their raw output, nothing else.
 - `/krites:receipt` writes the last run as a signed JSON file and a Markdown rendering under `receipts/`.
-- `/krites:telemetry on|off` answers the weekly ping question (see [License and telemetry](#license-and-telemetry)).
+- `/krites:telemetry-on` and `/krites:telemetry-off` answer the weekly ping question, and `/krites:telemetry` shows the answer (see [License and telemetry](#license-and-telemetry)).
 
 Commit `krites.toml`. Until a repo has one, the plugin checks nothing there and says so once at session start.
 
@@ -52,9 +52,9 @@ krites  receipts/2026-09-25T16-11-37Z-382ebfd1.json
         receipts/2026-09-25T16-11-37Z-382ebfd1.md
 ```
 
-<a href=".github/assets/chip.mp4"><img alt="A circuit chip grows one crystal per check. The last check fails red and shrinks, then regrows green, while the chip turns slowly." src=".github/assets/chip.gif" width="440"></a>
+<a href=".github/assets/chip.gif"><img alt="A circuit chip grows one crystal per check. The last check fails red and shrinks, then regrows green, while the chip turns slowly." src=".github/assets/chip.gif" width="440"></a>
 
-Adapted from the site's How it works animation: one crystal per check in the sample receipt, with a scripted failure on the last check before it passes. Click for the MP4.
+Adapted from the site's How it works animation: one crystal per check in the sample receipt, with a scripted failure on the last check before it passes.
 
 ## How it works
 
@@ -164,7 +164,7 @@ Krites makes no model calls and does no routing between agents. Pro is in develo
 
 Apache-2.0.
 
-Telemetry is off until you are asked and say yes. `/krites:init`, `/krites:verify` and `/krites:receipt` end with the question until you answer it: may Krites send a ping to krites.dev, now and once a week, `{ "install_id": "<random uuid>", "version": "<plugin version>", "os": "win32|darwin|linux", "ts": "<time>" }`, and nothing else. The install id is random but stays the same from one ping to the next, so the ping is pseudonymous, not anonymous. Pings go to https://krites.dev/ping, a Cloudflare Worker run by Krites, which stores the install id, version, OS and timestamp and the day the ping was received, and does not store your IP address or any request header. Pings are kept for 12 months. The `KRITES_PING_ENDPOINT` environment variable wins over the built-in endpoint, and `KRITES_PING_ENDPOINT=off` (any case) switches telemetry off altogether: nothing is asked and nothing is sent. An empty value uses the built-in endpoint. After a yes, the ping leaves at most once a week, from the first allowed stop or Krites command of that week, in whichever repo that happens, with or without a `krites.toml`. It never leaves from a blocked or timed-out stop and never changes a verdict. `/krites:telemetry off` is permanent until you run `/krites:telemetry on`. The answer is stored next to the signing key, never in a repo.
+Telemetry is off until you are asked and say yes. `/krites:init`, `/krites:verify` and `/krites:receipt` end with the question until you answer it: may Krites send a ping to krites.dev, now and once a week, `{ "install_id": "<random uuid>", "version": "<plugin version>", "os": "win32|darwin|linux", "ts": "<time>" }`, and nothing else. The install id is random but stays the same from one ping to the next, so the ping is pseudonymous, not anonymous. Pings go to https://krites.dev/ping, a Cloudflare Worker run by Krites, which stores the install id, version, OS and timestamp and the day the ping was received, and does not store your IP address or any request header. Pings are kept for 12 months. The `KRITES_PING_ENDPOINT` environment variable wins over the built-in endpoint, and `KRITES_PING_ENDPOINT=off` (any case) switches telemetry off altogether: nothing is asked and nothing is sent. An empty value uses the built-in endpoint. After a yes, the ping leaves at most once a week, from the first allowed stop or Krites command of that week, in whichever repo that happens, with or without a `krites.toml`. It never leaves from a blocked or timed-out stop and never changes a verdict. `/krites:telemetry-off` is permanent until you run `/krites:telemetry-on`. The answer is stored next to the signing key, never in a repo.
 
 Krites is built by Quinn Lott. Report a vulnerability privately to hello@krites.dev, not in a public issue; see [SECURITY.md](SECURITY.md).
 

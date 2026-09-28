@@ -1,10 +1,11 @@
 {
   "name": "krites",
-  "version": "0.2.3",
-  "description": "Requires Node 20 or later. Protects judge files from the edit tools and gates the stop on the repo's own checks.",
+  "version": "0.2.4",
+  "description": "Protects judge files from the edit tools and gates the stop on the repo's own checks. Requires Node 20 or later.",
   "author": {
     "name": "Quinn Lott",
     "email": "hello@krites.dev"
   },
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "keywords": ["testing", "verification", "hooks", "receipts"]
 }

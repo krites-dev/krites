@@ -85,7 +85,7 @@ test("init: plain init prints the Node line and the proposal and writes nothing 
   assert.strictEqual(result.stderr, "");
   assert.ok(result.stdout.includes(`Node ${process.version} detected. Krites needs Node 20 or later.`), result.stdout);
   assert.ok(result.stdout.includes(cli.proposal(cli.detect(dir)).trimEnd()), "the proposal is shown exactly as it would be written");
-  assert.match(result.stdout, /Nothing was written\. Run \/krites:init --write to create it\.$/m);
+  assert.match(result.stdout, /Nothing was written\. Run \/krites:init-write to create it\.$/m);
   assert.doesNotMatch(result.stdout, ABSOLUTE);
   assert.deepStrictEqual(listing(dir), before, "plain init writes nothing at all");
 });
@@ -124,6 +124,8 @@ test("init: --write on an existing krites.toml records its hash and never change
   fs.appendFileSync(path.join(repo, "krites.toml"), "\n# approved by hand\n");
   fs.writeFileSync(path.join(repo, "a.txt"), "changed\n");
   assertBlock(await runHook(GATE, stop(repo), { cwd: repo }), /protected path changed: krites\.toml/);
+  const shown = (await runCli(["init"], { cwd: repo })).stdout;
+  assert.match(shown, /Nothing was written\. Run \/krites:init-write to approve this krites\.toml for the gate\.$/m, "plain init names the command that approves");
 
   const before = fs.readFileSync(path.join(repo, "krites.toml"));
   const result = await runCli(["init", "--write"], { cwd: repo });
