@@ -10,11 +10,10 @@
 Krites runs your checks itself and blocks the stop until they pass. It is a Claude Code plugin: every check is a command from your own repo and its exit code, run by the plugin's process, never narrated by the model. Open source, no account, verifies offline. Pronounced KRY-tees.
 
 ```sh
-claude plugin marketplace add krites-dev/krites
-claude plugin install krites@krites
+claude plugin install krites@anthropic-plugin-directory
 ```
 
-Requires Claude Code and Node 20 or later. Inside a session, `/plugin marketplace add krites-dev/krites` and `/plugin install krites@krites` do the same.
+Requires Claude Code and Node 20 or later. This installs from Anthropic's plugin directory, which Claude Code includes as the built-in marketplace `anthropic-plugin-directory`; inside a session, `/plugin install krites@anthropic-plugin-directory` does the same. To install from this repo instead: `claude plugin marketplace add krites-dev/krites`, then `claude plugin install krites@krites`.
 
 - `/krites:init` shows the `krites.toml` it would write for this repo and the Node version it found. `/krites:init-write` creates it, or approves a `krites.toml` you edited yourself.
 - `/krites:verify` runs the configured checks now and prints their raw output, nothing else.
@@ -120,7 +119,7 @@ To stop gating a repo, delete `.krites/` and remove `krites.toml`. If a stop is 
 
 ## Pinning a release
 
-The install above follows this repo's default branch; Claude Code leaves auto-update off for a third-party marketplace by default, so nothing changes until you update it. Every release is tagged `krites--v<version>`, the version in `.claude-plugin/plugin.json`. The release script never moves a pushed tag, but a tag can be moved by hand on GitHub, so pin the commit too when that matters.
+An install from this repo follows its default branch; Claude Code leaves auto-update off for a third-party marketplace by default, so nothing changes until you update it. Every release is tagged `krites--v<version>`, the version in `.claude-plugin/plugin.json`. The release script never moves a pushed tag, but a tag can be moved by hand on GitHub, so pin the commit too when that matters. If you installed from the directory, run `claude plugin uninstall krites@anthropic-plugin-directory` first, so only one copy runs.
 
 ```text
 /plugin marketplace add https://github.com/krites-dev/krites.git#krites--v<version>
