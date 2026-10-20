@@ -15,20 +15,26 @@ const start = (cwd) => ({ hook_event_name: "SessionStart", source: "startup", se
 const stop = (cwd) => ({ hook_event_name: "Stop", stop_hook_active: false, session_id: "s1", cwd });
 const baseline = (repo) => fs.readFileSync(path.join(repo, ".krites", "session-head"), "utf8").trim();
 
-function assertOneLine(result) {
+const NUDGE = "Krites is installed but this repo has no krites.toml, so nothing is being checked. Run /krites:init to create one.";
+const NO_CHECKS = "krites.toml configures no checks, so nothing is being checked until [checks].commands names a command.";
+const SLOW_ONLY = "krites.toml runs no check at a stop; [checks].slow runs only under /krites:verify.";
+const GAVE_UP = "in the last session the Krites stop gate gave up after 3 blocked attempts, so that work ended without passing its checks. Run /krites:verify.";
+const NOT_PARSED = "Krites is not running: krites.toml line 4: unknown key checks.nope. Run /krites:init.";
+const FAILED = (what) => `the Krites session hook ${what}, so the stop gate may compare against a stale baseline.`;
+
+function message(result) {
   assert.strictEqual(result.code, 0);
   assert.strictEqual(result.stderr, "");
-  assert.doesNotMatch(result.stdout, ABSOLUTE, "no absolute path in the line the model receives");
-  assert.strictEqual(result.stdout.trimEnd().split("\n").length, 1, `exactly one line: ${result.stdout}`);
-  assert.doesNotMatch(result.stdout, /"decision"|permissionDecision/, "SessionStart never blocks");
-  return result.stdout;
+  const out = JSON.parse(result.stdout);
+  assert.deepStrictEqual(Object.keys(out), ["systemMessage"], "shown to the user, never context for the model, never a decision");
+  assert.doesNotMatch(out.systemMessage, ABSOLUTE, "no absolute path in what the user sees");
+  assert.doesNotMatch(out.systemMessage, /Tell the user/);
+  return out.systemMessage;
 }
 
-test("session: a git repo with no krites.toml gets one line telling the user to run /krites:init", async () => {
+test("session: a git repo with no krites.toml tells the user to run /krites:init", async () => {
   const repo = makeRepo({ files: { "a.txt": "a\n" } });
-  const line = assertOneLine(await runHook(SESSION, start(repo), { cwd: repo }));
-  assert.match(line, /krites\.toml/);
-  assert.match(line, /\/krites:init/);
+  assert.strictEqual(message(await runHook(SESSION, start(repo), { cwd: repo })), NUDGE);
   assert.strictEqual(fs.existsSync(path.join(repo, ".krites")), false, "the nudge writes nothing");
 });
 
@@ -56,22 +62,15 @@ test("session: the root can come from CLAUDE_PROJECT_DIR", async () => {
 
 test("session: an empty command list says so in one line, and still records the baseline", async () => {
   const repo = configure(makeRepo({ files: { "a.txt": "a\n" } }), { commands: [] });
-  const line = assertOneLine(await runHook(SESSION, start(repo), { cwd: repo }));
-  assert.match(line, /no checks|nothing is being checked/i);
+  assert.strictEqual(message(await runHook(SESSION, start(repo), { cwd: repo })), NO_CHECKS);
   assert.strictEqual(baseline(repo), head(repo));
 });
 
 test("session: slow checks alone say they run only under /krites:verify; both empty keep the no-checks line", async () => {
   const slowOnly = configure(makeRepo({ files: { "a.txt": "a\n" } }), { commands: [], slow: [script("")] });
-  assert.strictEqual(
-    assertOneLine(await runHook(SESSION, start(slowOnly), { cwd: slowOnly })).trimEnd(),
-    "Tell the user: krites.toml runs no check at a stop; [checks].slow runs only under /krites:verify.",
-  );
+  assert.strictEqual(message(await runHook(SESSION, start(slowOnly), { cwd: slowOnly })), SLOW_ONLY);
   const empty = configure(makeRepo({ files: { "a.txt": "a\n" } }), { commands: [], slow: [] });
-  assert.strictEqual(
-    assertOneLine(await runHook(SESSION, start(empty), { cwd: empty })).trimEnd(),
-    "Tell the user: krites.toml configures no checks, so nothing is being checked until [checks].commands names a command.",
-  );
+  assert.strictEqual(message(await runHook(SESSION, start(empty), { cwd: empty })), NO_CHECKS);
   const both = configure(makeRepo({ files: { "a.txt": "a\n" } }), { commands: [script("")], slow: [script("")] });
   assert.deepStrictEqual(await runHook(SESSION, start(both), { cwd: both }), SILENT);
 });
@@ -80,9 +79,7 @@ test("session: a spent budget is reported in one line, and every start resets th
   const repo = configure(makeRepo({ files: { "a.txt": "a\n" } }), { commands: [script("")] });
   writeBlockCount(repo, 4);
 
-  const line = assertOneLine(await runHook(SESSION, start(repo), { cwd: repo }));
-  assert.match(line, /gave up after 3 blocked attempts/);
-  assert.match(line, /\/krites:verify/);
+  assert.strictEqual(message(await runHook(SESSION, start(repo), { cwd: repo })), GAVE_UP);
   assert.strictEqual(readBlockCount(repo), 0);
 
   writeBlockCount(repo, 3);
@@ -94,14 +91,7 @@ test("session: a spent budget and an empty command list are two lines", async ()
   const repo = configure(makeRepo({ files: { "a.txt": "a\n" } }), { commands: [] });
   writeBlockCount(repo, 4);
 
-  const result = await runHook(SESSION, start(repo), { cwd: repo });
-  assert.strictEqual(result.code, 0);
-  assert.strictEqual(result.stderr, "");
-  assert.doesNotMatch(result.stdout, ABSOLUTE);
-  const lines = result.stdout.trimEnd().split("\n");
-  assert.strictEqual(lines.length, 2, result.stdout);
-  assert.match(lines[0], /gave up after 3 blocked attempts/);
-  assert.match(lines[1], /nothing is being checked/);
+  assert.deepStrictEqual(message(await runHook(SESSION, start(repo), { cwd: repo })).split("\n"), [GAVE_UP, NO_CHECKS]);
 });
 
 test("session: a root whose config does not parse is reported and reset too", async () => {
@@ -112,18 +102,12 @@ test("session: a root whose config does not parse is reported and reset too", as
   // The count a broken root can carry is what its blocks spent while the config still loaded.
   writeBlockCount(repo, 4);
 
-  const result = await runHook(SESSION, start(repo), { cwd: repo });
-  assert.strictEqual(result.code, 0);
-  assert.strictEqual(result.stderr, "");
-  const lines = result.stdout.trimEnd().split("\n");
-  assert.strictEqual(lines.length, 2, result.stdout);
-  assert.match(lines[0], /gave up after 3 blocked attempts/);
-  assert.match(lines[1], /krites\.toml line 4: /);
+  assert.deepStrictEqual(message(await runHook(SESSION, start(repo), { cwd: repo })).split("\n"), [GAVE_UP, NOT_PARSED]);
   assert.strictEqual(readBlockCount(repo), 0, "a config error no longer keeps the counter across sessions");
   assert.strictEqual(fs.existsSync(path.join(repo, ".krites", "session-head")), false, "still no baseline");
 
   const untouched = configure(makeRepo({ files: { "a.txt": "a\n" } }), broken);
-  assertOneLine(await runHook(SESSION, start(untouched), { cwd: untouched }));
+  assert.strictEqual(message(await runHook(SESSION, start(untouched), { cwd: untouched })), NOT_PARSED);
   assert.strictEqual(fs.existsSync(path.join(untouched, ".krites")), false, "a counter already at 0 is not written back");
 });
 
@@ -142,12 +126,10 @@ test("session: one root that cannot record its baseline does not cost the next r
   fs.writeFileSync(path.join(inner, ".krites", "session-head", "held.txt"), "held\n");
 
   const result = await runHook(SESSION, start(inner), { cwd: inner, env: { CLAUDE_PROJECT_DIR: outer.replace(/\\/g, "/") } });
-  assert.strictEqual(result.code, 0);
-  assert.strictEqual(result.stderr, "");
-  assert.doesNotMatch(result.stdout, ABSOLUTE);
-  const lines = result.stdout.trimEnd().split("\n");
-  assert.strictEqual(lines.filter((line) => /gave up after 3 blocked attempts/.test(line)).length, 2, result.stdout);
-  assert.strictEqual(lines.filter((line) => /session hook failed \(E[A-Z]+\)/.test(line)).length, 1, result.stdout);
+  const lines = message(result).split("\n");
+  const failed = /^the Krites session hook failed \(E[A-Z]+\), so the stop gate may compare against a stale baseline\.$/;
+  assert.strictEqual(lines.filter((line) => line === GAVE_UP).length, 2, result.stdout);
+  assert.strictEqual(lines.filter((line) => failed.test(line)).length, 1, result.stdout);
   assert.strictEqual(readBlockCount(inner), 0);
   assert.strictEqual(readBlockCount(outer), 0, "the root behind the failing one is reset too");
   assert.strictEqual(baseline(outer), head(outer), "and gets its baseline");
@@ -162,17 +144,13 @@ test("session: the config hash is recorded next to the baseline", async () => {
   assert.strictEqual(fs.readFileSync(path.join(repo, ".krites", "config-hash"), "utf8").trim(), expected);
 });
 
-test("session: a payload that is not an object records nothing and never blocks", async () => {
-  const result = await runHook(SESSION, '"a string"');
-  assert.strictEqual(result.code, 0);
-  assert.strictEqual(result.stderr, "");
-  assert.doesNotMatch(result.stdout, /"decision"/);
+test("session: a payload that is not an object records nothing and stays silent", async () => {
+  assert.deepStrictEqual(await runHook(SESSION, '"a string"'), SILENT);
 });
 
 test("session: a config that does not parse is reported in one line and no baseline is written", async () => {
   const repo = configure(makeRepo({ files: { "a.txt": "a\n" } }), "version = 1\n\n[checks]\nnope = 1\n");
-  const line = assertOneLine(await runHook(SESSION, start(repo), { cwd: repo }));
-  assert.match(line, /krites\.toml line 4: .*Run \/krites:init\./);
+  assert.strictEqual(message(await runHook(SESSION, start(repo), { cwd: repo })), NOT_PARSED);
   assert.strictEqual(fs.existsSync(path.join(repo, ".krites", "session-head")), false);
 });
 
@@ -182,9 +160,6 @@ test("session: a repo with no commits writes an empty baseline", async () => {
   assert.strictEqual(baseline(repo), "");
 });
 
-test("session: malformed input never blocks the session", async () => {
-  const result = await runHook(SESSION, "{not json");
-  assert.strictEqual(result.code, 0);
-  assert.strictEqual(result.stderr, "");
-  assert.doesNotMatch(result.stdout, /"decision"/);
+test("session: malformed input is reported to the user and never blocks the session", async () => {
+  assert.strictEqual(message(await runHook(SESSION, "{not json")), FAILED("could not read its input"));
 });
