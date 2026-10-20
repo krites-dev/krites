@@ -6,7 +6,7 @@ const { test } = require("node:test");
 const cli = require("../cli.js");
 const { loadConfig } = require("../lib/config.js");
 const { hashText, readConfigHash } = require("../lib/state.js");
-const { ABSOLUTE, assertBlock, configure, makeDir, makeRepo, runCli, runHook, script, seed } = require("./helpers.js");
+const { ABSOLUTE, assertBlock, configure, FAKE, makeDir, makeRepo, runCli, runHook, script, seed } = require("./helpers.js");
 
 const GATE = path.join(__dirname, "..", "hooks", "gate.js");
 const SILENT = { code: 0, stdout: "", stderr: "" };
@@ -137,7 +137,7 @@ test("init: --write on an existing krites.toml records its hash and never change
 
 test("init: approving a krites.toml shows the [checks.env] it runs with", async () => {
   const repo = makeRepo({ files: { "a.txt": "a\n" } });
-  configure(repo, `version = 1\n\n[checks]\ncommands = ["make vulncheck"]\n\n[checks.env]\nGOTOOLCHAIN = "go1.26.6"\nAPI_TOKEN = "sk-abcdefghijklmnopqrstuvwxyz0123"\n`);
+  configure(repo, `version = 1\n\n[checks]\ncommands = ["make vulncheck"]\n\n[checks.env]\nGOTOOLCHAIN = "go1.26.6"\nAPI_TOKEN = "${FAKE.sk}"\n`);
   const result = await runCli(["init"], { cwd: repo });
   assert.match(result.stdout, /runs:\n {2}make vulncheck\nwith this environment:\n {2}GOTOOLCHAIN=go1\.26\.6\n {2}API_TOKEN=<redacted>\n/);
   assert.ok(!result.stdout.includes("sk-abcdefghij"));

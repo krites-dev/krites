@@ -5,9 +5,9 @@ const os = require("node:os");
 const path = require("node:path");
 const { test } = require("node:test");
 
-const { scrub } = require("../lib/scrub.js");
+const { scrub, TOKEN } = require("../lib/scrub.js");
 const { writeBlockCount } = require("../lib/state.js");
-const { ABSOLUTE, configure, hookText, makeDir, makeRepo, runCli, runHook, script, seed, textOf, tmp, toml } = require("./helpers.js");
+const { ABSOLUTE, configure, FAKE, hookText, makeDir, makeRepo, runCli, runHook, script, seed, textOf, tmp, toml } = require("./helpers.js");
 
 const HOOKS = path.join(__dirname, "..", "hooks");
 const PLUGIN = path.join(__dirname, "..");
@@ -218,7 +218,7 @@ test("output: scrub removes the path forms compilers print and redacts token sha
   assert.strictEqual(scrub(`at ${root}${path.sep}src${path.sep}lib.rs:3`, root), `at .${path.sep}src${path.sep}lib.rs:3`);
   assert.strictEqual(scrub("red \x1b[31mtext\x1b[0m", root), "red text");
 
-  for (const token of ["sk-abcdefghijklmnopqrstuvwx", "ghp_abcdefghijklmnopqrstuvwxyz012345", "Bearer abcdefghijklmnopqrst"]) {
+  for (const token of [FAKE.sk, FAKE.ghp, FAKE.bearer]) {
     assert.strictEqual(scrub(`key ${token} end`, root), "key <redacted> end", token);
   }
 
@@ -287,7 +287,7 @@ test("output: scrub redacts empty-user DSNs, env names, JSON keys, auth headers 
     ["Authorization: Basic dXNlcjpwYXNz", "Authorization: Basic <redacted>"],
     ["authorization: Token abc123def", "authorization: Token <redacted>"],
     ['Proxy-Authorization: Digest username="u", response="abc"', "Proxy-Authorization: Digest <redacted>"],
-    ["Authorization: Bearer abcdefghijklmnopqrst", "Authorization: <redacted>"],
+    [`Authorization: ${FAKE.bearer}`, "Authorization: <redacted>"],
     ["mysql --password hunter2 -h localhost", "mysql --password <redacted> -h localhost"],
     ["run --db-password 'a b' --verbose", "run --db-password <redacted> --verbose"],
     ["--api-key abc", "--api-key <redacted>"],
@@ -363,4 +363,15 @@ test("output: a failing check that prints a DSN leaves its password in no sink",
   ];
   assert.strictEqual(sinks.length, 6, "one receipt in each form");
   for (const [label, text] of sinks) assert.ok(!text.includes("hunter2"), `${label} holds the password:\n${text}`);
+});
+
+test("output: no shipped file holds a literal the scrubber would redact as a token", () => {
+  const files = (dir) =>
+    fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      if (["node_modules", "target", ".git"].includes(entry.name)) return [];
+      const full = path.join(dir, entry.name);
+      return entry.isDirectory() ? files(full) : [full];
+    });
+  const hits = files(PLUGIN).flatMap((file) => (fs.readFileSync(file, "utf8").match(TOKEN) || []).map((hit) => `${path.relative(PLUGIN, file)}: ${hit}`));
+  assert.deepStrictEqual(hits, [], "the directory's credential scan reads these as shipped secrets");
 });

@@ -6,7 +6,7 @@ const path = require("node:path");
 const { test } = require("node:test");
 
 const { readBaseline, readBlockCount, readConfigHash, writeBlockCount } = require("../lib/state.js");
-const { ABSOLUTE, assertBlock, configure, fromTmp, git, head, makeDir, makeRepo, runCli, runHook, script, seed, textOf, tmp, toml } = require("./helpers.js");
+const { ABSOLUTE, assertBlock, configure, FAKE, fromTmp, git, head, makeDir, makeRepo, runCli, runHook, script, seed, textOf, tmp, toml } = require("./helpers.js");
 
 const GATE = path.join(__dirname, "..", "hooks", "gate.js");
 const SILENT = { code: 0, stdout: "", stderr: "" };
@@ -160,7 +160,7 @@ test("gate: a config that does not load is held, and the root behind it is judge
 
 test("gate: a held config error goes through the scrub like every other reason", async () => {
   // An unknown key is echoed by the parser, and a key can be shaped like a credential.
-  const key = "ghp_0123456789abcdefghijABCDEFGHIJ";
+  const key = FAKE.ghp;
   const repo = repoWith(`version = 1\n\n[checks]\n${key} = 1\n`);
   const reason = assertBlock(await runHook(GATE, stop(repo), { cwd: repo }), /krites.toml line 4: /);
   assert.ok(!reason.includes(key), `the key is not echoed as it stands: ${reason}`);
@@ -739,7 +739,7 @@ test("gate: the tail is scrubbed of absolute paths and color codes", async () =>
     console.error("\\x1b[31mat " + ${JSON.stringify(path.join(repo, "src", "lib.rs"))} + ":3\\x1b[0m");
     console.error("home " + ${JSON.stringify(path.join(os.homedir(), ".cargo", "registry", "x.rs"))});
     console.error("foreign " + ${JSON.stringify(WINDOWS ? "Q:\\build\\agent\\out.log" : "/usr/build/agent/out.log")});
-    console.error("token sk-abcdefghijklmnopqrstuvwxyz0123");
+    console.error("token ${FAKE.sk}");
     process.exit(3);`);
   const unreached = script("console.log('unreached')");
   configure(repo, { commands: [pass(), noisy, unreached] });
@@ -768,7 +768,7 @@ test("gate: the tail is scrubbed of absolute paths and color codes", async () =>
 test("gate: [checks.env] reaches every check, and the run file records it scrubbed", async () => {
   const repo = makeRepo({ files: { "a.txt": "a\n" } });
   const needs = script('process.exit(process.env.GOTOOLCHAIN === "go1.26.6" && process.env.krites_t4_case === "new" ? 0 : 1)');
-  const env = '\n[checks.env]\nGOTOOLCHAIN = "go1.26.6"\nkrites_t4_case = "new"\nAPI_TOKEN = "sk-abcdefghijklmnopqrstuvwxyz0123"\n';
+  const env = `\n[checks.env]\nGOTOOLCHAIN = "go1.26.6"\nkrites_t4_case = "new"\nAPI_TOKEN = "${FAKE.sk}"\n`;
   const inherited = { KRITES_T4_CASE: "old" };
 
   configure(repo, toml({ commands: [needs] }));

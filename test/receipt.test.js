@@ -8,7 +8,7 @@ const receipts = require("../lib/receipt.js");
 const sign = require("../lib/sign.js");
 const { writeBlockCount } = require("../lib/state.js");
 const verifier = require("../verify-receipt.js");
-const { ABSOLUTE, configure, git, makeRepo, runCli, runHook, script, seed, textOf, tmp, toml } = require("./helpers.js");
+const { ABSOLUTE, configure, FAKE, git, makeRepo, runCli, runHook, script, seed, textOf, tmp, toml } = require("./helpers.js");
 
 const GATE = path.join(__dirname, "..", "hooks", "gate.js");
 const VERIFIER = path.join(__dirname, "..", "verify-receipt.js");
@@ -541,7 +541,7 @@ test("receipt: env comes from the run file scrubbed, and a run file without it s
   assert.strictEqual(older.ok, true, older.reason);
   assert.deepStrictEqual([older.receipt.env, older.receipt.slow, older.receipt.not_run], [[], [], []]);
 
-  fs.writeFileSync(file, `${JSON.stringify({ ...run, env: ["GOTOOLCHAIN=go1.26.6", "API_TOKEN=sk-abcdefghijklmnopqrstuvwxyz0123"] }, null, 2)}\n`);
+  fs.writeFileSync(file, `${JSON.stringify({ ...run, env: ["GOTOOLCHAIN=go1.26.6", `API_TOKEN=${FAKE.sk}`] }, null, 2)}\n`);
   const built = receipts.build(repo);
   assert.deepStrictEqual(built.receipt.env, ["GOTOOLCHAIN=go1.26.6", "API_TOKEN=<redacted>"]);
   const where = receipts.write(repo, built.receipt, DIR);
