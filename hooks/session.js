@@ -1,6 +1,6 @@
 const { DEFAULT_MAX_BLOCKS, findRoots, loadConfig } = require("../lib/config.js");
 const hookio = require("../lib/hookio.js");
-const { git, readBlockCount, writeBaseline, writeBlockCount, writeConfigHash } = require("../lib/state.js");
+const { APPROVED, dropRange, git, readBlockCount, writeBaseline, writeBlockCount, writeConfigHash } = require("../lib/state.js");
 
 const NUDGE = "Krites is installed but this repo has no krites.toml, so nothing is being checked. Run /krites:init to create one.";
 const NO_CHECKS = "krites.toml configures no checks, so nothing is being checked until [checks].commands names a command.";
@@ -18,14 +18,16 @@ const isObject = (value) => typeof value === "object" && value !== null && !Arra
 
 function handle(payload) {
   const cwd = isObject(payload) ? payload.cwd : undefined;
+  // A /clear can follow an interrupted turn that ran no gate, so it keeps the baseline, the approved config and any approval.
+  const clearing = isObject(payload) && payload.source === "clear";
   const roots = findRoots({ cwd, projectDir: process.env.CLAUDE_PROJECT_DIR });
-  if (roots.length === 0) return say(insideGit(cwd) ? [NUDGE] : []);
+  if (roots.length === 0) return say(!clearing && insideGit(cwd) ? [NUDGE] : []);
 
   const lines = [];
   for (const entry of roots) {
     // One root that cannot record its state must not cost the roots behind it their report, reset and baseline.
     try {
-      startRoot(entry, lines);
+      startRoot(entry, lines, clearing);
     } catch (err) {
       lines.push(FAILED(`failed (${err.code || err.name})`));
     }
@@ -33,14 +35,16 @@ function handle(payload) {
   return say(lines);
 }
 
-function startRoot(entry, lines) {
+function startRoot(entry, lines, clearing) {
   const loaded = entry.error ? { ok: false, error: entry.error } : loadConfig(entry.root);
   // Above the budget, not at it: the extra count is the stop the gate let through after giving up.
   const budget = loaded.ok ? loaded.config.checks.max_blocks : DEFAULT_MAX_BLOCKS;
   const count = readBlockCount(entry.root);
   if (count > budget) lines.push(GAVE_UP(budget));
   if (count !== 0) writeBlockCount(entry.root, 0);
+  if (!clearing) dropRange(entry.root, APPROVED);
   if (!loaded.ok) return lines.push(`Krites is not running: ${loaded.error}`);
+  if (clearing) return;
   writeBaseline(entry.root, (git(entry.root, ["rev-parse", "HEAD"]) || "").trim());
   if (loaded.hash !== undefined) writeConfigHash(entry.root, loaded.hash);
   const { commands, slow } = loaded.config.checks;

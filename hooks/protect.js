@@ -2,14 +2,16 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const { findRoots, loadConfig, loadUserConfig, protectedGlobs } = require("../lib/config.js");
+const { enclosingRoots, findRoots, loadConfig, loadUserConfig, protectedGlobs } = require("../lib/config.js");
 const { matches } = require("../lib/glob.js");
 const hookio = require("../lib/hookio.js");
 const { configDir } = require("../lib/sign.js");
+const state = require("../lib/state.js");
 
 const PATH_KEYS = ["file_path", "path", "notebook_path"];
 const UNC = /^[\\/]{2}(?:[?.][\\/]UNC[\\/]|(?![?.][\\/]))/i;
 const WINDOWS = process.platform === "win32";
+const HEAD_TIMEOUT_MS = 4000;
 
 function lexists(file) {
   try {
@@ -99,7 +101,7 @@ function outsideReason(target, name, outside) {
   return null;
 }
 
-function reasonFor(file, roots, configs, memoryOf) {
+function reasonFor(file, roots, configs, memoryOf, touched) {
   if (typeof file !== "string" || file.includes("\0")) return "Blocked: the edit path is not a plain string.";
   // Either separator: on POSIX a backslash path is one long file name, and the reason must not echo it whole.
   const name = file.split(/[\\/]/).filter(Boolean).pop() || "the path";
@@ -123,13 +125,50 @@ function reasonFor(file, roots, configs, memoryOf) {
   if (WINDOWS && best.rel.includes(":")) return `Blocked: ${name} names an alternate data stream.`;
 
   // Win32 drops trailing dots and spaces from each component, so "tests./krites" lands in "tests/krites".
-  const parts = best.rel.split("/").map((part) => part.replace(/[. ]+$/, ""));
-  if (parts.includes("")) return `Blocked: ${name} has a path component made only of dots or spaces.`;
-  const rel = parts.join("/");
-  if (protectedGlobs(configs.get(best.entry.root)).some((glob) => matches(glob, rel))) {
-    return `Blocked: ${rel} is protected. Protected paths are human-edited only.`;
+  const fold = (rel) => rel.split("/").map((part) => part.replace(/[. ]+$/, ""));
+  if (fold(best.rel).includes("")) return `Blocked: ${name} has a path component made only of dots or spaces.`;
+  const nested = enclosingRoots(target, best.entry.root).filter((found) => found.root !== best.entry.root);
+  for (const entry of [best.entry, ...nested]) {
+    const loaded = configs.has(entry.root) ? { ok: true, config: configs.get(entry.root) } : entry.error ? { ok: false, error: entry.error } : loadConfig(entry.root);
+    if (!loaded.ok) {
+      const where = path.relative(best.entry.root, entry.root).replace(/\\/g, "/");
+      const fix = entry.error ? "" : ` Fix it from a session started in ${where}.`;
+      return `Blocked: ${where} is a Krites root of its own whose config cannot be used: ${loaded.error}${fix}`;
+    }
+    const rel = fold(path.relative(entry.root, target).replace(/\\/g, "/")).join("/");
+    if (protectedGlobs(loaded.config).some((glob) => matches(glob, rel))) {
+      return `Blocked: ${rel} is protected. Protected paths are human-edited only.`;
+    }
   }
+  touched.push({ target, nested: (nested[0] || best.entry).root });
   return null;
+}
+
+const holding = (roots, dir) => roots.filter((entry) => within(entry.root, dir)).sort((a, b) => a.root.length - b.root.length);
+
+// The project's root keeps the record when it holds the edited root, so an edit made with the cwd inside a nested root is recorded too.
+function anchorFor(roots, target, nested) {
+  const projectDir = process.env.CLAUDE_PROJECT_DIR;
+  const project = projectDir ? holding(roots, resolved(path.resolve(projectDir))).pop() : undefined;
+  const found = project && inside(project.root, nested) ? project : holding(roots, target)[0];
+  return found ? found.root : null;
+}
+
+// One `git rev-parse` at most per hook run (findRoots' own git check is separate), repeated on later edits
+// until the session's line for that root has a head. Whatever fails here, the decision stands.
+function remember(sessionId, touched, roots) {
+  for (const { target, nested } of touched) {
+    try {
+      const anchor = anchorFor(roots, target, nested);
+      if (anchor === null || !inside(anchor, nested)) continue;
+      const lines = state.readTouched(anchor, sessionId);
+      if (lines === null || lines.some((line) => line.root === nested && line.head !== null)) continue;
+      state.recordTouched(anchor, sessionId, nested, (state.git(nested, ["rev-parse", "HEAD"], HEAD_TIMEOUT_MS) || "").trim());
+      return;
+    } catch {
+      return;
+    }
+  }
 }
 
 function decide(payload, roots) {
@@ -148,11 +187,13 @@ function decide(payload, roots) {
   try {
     let memory;
     const memoryOf = () => (memory === undefined ? (memory = memoryDirOf(payload)) : memory);
+    const touched = [];
     for (const key of PATH_KEYS) {
       if (input[key] === undefined || input[key] === null || input[key] === "") continue;
-      const reason = reasonFor(input[key], roots, configs, memoryOf);
+      const reason = reasonFor(input[key], roots, configs, memoryOf, touched);
       if (reason) return reason;
     }
+    remember(payload.session_id, touched, roots);
     return null;
   } catch (err) {
     return `Blocked: the edit path could not be resolved (${err.code || err.name}).`;

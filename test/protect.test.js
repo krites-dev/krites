@@ -6,7 +6,7 @@ const { test } = require("node:test");
 
 const { findRoots } = require("../lib/config.js");
 const { decide } = require("../hooks/protect.js");
-const { ABSOLUTE, gitInit, makeDir, makeRepo, runHook, tmp } = require("./helpers.js");
+const { ABSOLUTE, git, gitInit, head, makeDir, makeRepo, runHook, tmp } = require("./helpers.js");
 
 const PROTECT = path.join(__dirname, "..", "hooks", "protect.js");
 const WINDOWS = process.platform === "win32";
@@ -359,6 +359,32 @@ test("protect: allow_outside = [\"~/**\"] still denies the signing key, the user
   });
 });
 
+test("protect: the README's scratchpad line opens a session scratchpad and nothing beside or above it", () => {
+  const block = '[protect]\nallow_outside = ["~/AppData/Local/Temp/claude/*/*/scratchpad/**"]\n';
+  const readme = fs.readFileSync(path.join(__dirname, "..", "README.md"), "utf8").replace(/\r\n/g, "\n");
+  assert.ok(readme.includes(`\`\`\`toml\n${block}\`\`\``), "the README shows this exact block");
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  const home = makeDir({ ".claude/settings.json": "{}\n", ".config/krites/config.toml": block });
+  const claude = path.join(home, "AppData", "Local", "Temp", "claude");
+  const session = path.join(claude, "D--work-repo", "3f2b8c1e-9a4d-4e7b-8c21-5d6f7a8b9c0d");
+
+  withEnv({ HOME: home, USERPROFILE: home, KRITES_CONFIG_DIR: path.join(home, ".config", "krites") }, () => {
+    assert.strictEqual(decide(input(path.join(session, "scratchpad", "probe.js")), roots), null);
+    assert.strictEqual(decide(input(path.join(session, "scratchpad", "spin", "build.js")), roots), null);
+    for (const denied of [
+      path.join(session, "scratchpad"),
+      path.join(session, "notes", "a.js"),
+      path.join(claude, "D--work-repo", "a.js"),
+      path.join(claude, "a.js"),
+      path.join(home, "AppData", "Local", "Temp", "a.js"),
+      path.join(home, ".claude", "settings.json"),
+    ]) {
+      assert.match(decide(input(denied), roots), /outside the repository/, denied);
+    }
+  });
+});
+
 test("protect: allow_outside = [\"~/**\"] still denies ~/.claude.json itself, and only that file", () => {
   const repo = makeRepo({ files: { "krites.toml": CONFIG } });
   const roots = findRoots({ cwd: repo, processCwd: tmp });
@@ -477,4 +503,244 @@ test("protect: on Windows allow_outside matches a target on another drive by its
     assert.match(decide(input(`${drive}:\\elsewhere\\x.txt:s`), roots), /alternate data stream/);
     assert.strictEqual(decide(input(`${drive}:\\elsewhere.\\x.txt`), roots), null, "Win32 drops the trailing dot, so the write lands in the allowed folder");
   });
+});
+
+const FIXTURES_ONLY = 'version = 1\n\n[protect]\nglobs = ["fixtures/**"]\n';
+
+function nestedIn(outer, rel, files) {
+  const nested = path.join(outer, ...rel.split("/"));
+  fs.mkdirSync(nested, { recursive: true });
+  gitInit(nested);
+  for (const [name, content] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(nested, name)), { recursive: true });
+    fs.writeFileSync(path.join(nested, name), content);
+  }
+  return nested;
+}
+
+test("protect: a nested repo's own globs apply to its files from a session at the outer repo", async () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const nested = nestedIn(repo, "target/wt/x", { "krites.toml": FIXTURES_ONLY });
+  assertDeny(await runHook(PROTECT, edit({ file_path: path.join(nested, "fixtures", "a.txt") }, repo)), /: fixtures\/a\.txt is protected/);
+  assert.deepStrictEqual(await runHook(PROTECT, edit({ file_path: path.join(nested, "src", "a.rs") }, repo)), SILENT);
+});
+
+test("protect: a git worktree inside the session's repo is held to its own krites.toml", () => {
+  const repo = makeRepo({ files: { "krites.toml": FIXTURES_ONLY } });
+  const tree = path.join(repo, "target", "wt", "x");
+  assert.strictEqual(git(repo, "worktree", "add", "-q", "-b", "x", tree).status, 0);
+  assert.ok(fs.statSync(path.join(tree, ".git")).isFile());
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  assert.match(decide(input(path.join(tree, "fixtures", "a.txt")), roots), /: fixtures\/a\.txt is protected/);
+});
+
+test("protect: the outer repo's globs still apply inside a nested root", () => {
+  const repo = makeRepo({ files: { "krites.toml": 'version = 1\n\n[protect]\nglobs = [".claude/**"]\n' } });
+  const nested = nestedIn(repo, ".claude/worktrees/x", { "krites.toml": 'version = 1\n\n[protect]\nglobs = ["tests/**"]\n' });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  assert.match(decide(input(path.join(nested, "src", "a.rs")), roots), /\.claude\/worktrees\/x\/src\/a\.rs is protected/);
+  assert.match(decide(input(path.join(nested, "tests", "a")), roots), /: \.claude\/worktrees\/x\/tests\/a is protected/, "the outer root is asked first");
+});
+
+test("protect: a plain repo between a nested root and the target does not end the walk", () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const nested = nestedIn(repo, "target/wt/x", { "krites.toml": FIXTURES_ONLY });
+  const plain = nestedIn(nested, "fixtures/sub", { "a.txt": "a\n" });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  assert.match(decide(input(path.join(plain, "a.txt")), roots), /: fixtures\/sub\/a\.txt is protected/);
+});
+
+test("protect: every nested level is held to its own globs, the innermost named first", () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const outer = nestedIn(repo, "target/wt/x", { "krites.toml": 'version = 1\n\n[protect]\nglobs = ["vendor/**"]\n' });
+  const inner = nestedIn(outer, "vendor/y", { "krites.toml": 'version = 1\n\n[protect]\nglobs = ["docs/**"]\n' });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  assert.match(decide(input(path.join(inner, "docs", "a.md")), roots), /: docs\/a\.md is protected/);
+  assert.match(decide(input(path.join(inner, "src", "a.rs")), roots), /: vendor\/y\/src\/a\.rs is protected/);
+});
+
+test("protect: the walk starts no process, so a planted .git cannot hold the hook past its timeout", () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const nested = nestedIn(repo, "target/wt/x", { "krites.toml": FIXTURES_ONLY });
+  for (const dir of [path.join(repo, "target"), path.join(repo, "target", "wt")]) fs.writeFileSync(path.join(dir, ".git"), "gitdir: //192.0.2.1/share/x\n");
+  const child = require("node:child_process");
+  const { spawnSync } = child;
+  const file = require.resolve("../lib/config.js");
+  const cached = require.cache[file];
+  const calls = [];
+  child.spawnSync = (...args) => (calls.push(args), spawnSync(...args));
+  try {
+    delete require.cache[file];
+    const found = require(file).enclosingRoots(path.join(nested, "fixtures", "a.txt"), repo);
+    assert.deepStrictEqual(found.map((entry) => entry.root), [fs.realpathSync.native(nested), fs.realpathSync.native(repo)]);
+  } finally {
+    child.spawnSync = spawnSync;
+    require.cache[file] = cached;
+  }
+  assert.deepStrictEqual(calls, []);
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  assert.match(decide(input(path.join(nested, "fixtures", "a.txt")), roots), /: fixtures\/a\.txt is protected/);
+});
+
+test("protect: a nested repo whose committed krites.toml is missing from its tree is not a root of its own", () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const nested = nestedIn(repo, "target/wt/x", { "krites.toml": FIXTURES_ONLY });
+  git(nested, "add", "-A");
+  git(nested, "commit", "-qm", "config");
+  fs.unlinkSync(path.join(nested, "krites.toml"));
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  assert.strictEqual(decide(input(path.join(nested, "fixtures", "a.txt")), roots), null);
+});
+
+test("protect: a session rooted in a worktree under .claude is not held to the outer .claude/** glob", () => {
+  const repo = makeRepo({ files: { "krites.toml": 'version = 1\n\n[protect]\nglobs = [".claude/**"]\n' } });
+  const nested = nestedIn(repo, ".claude/worktrees/x", { "krites.toml": 'version = 1\n\n[protect]\nglobs = ["tests/**"]\n' });
+  const roots = findRoots({ cwd: nested, projectDir: repo, processCwd: tmp });
+  assert.strictEqual(decide(input(path.join(nested, "src", "a.rs")), roots), null);
+  assert.match(decide(input(path.join(nested, "tests", "a")), roots), /: tests\/a is protected/);
+});
+
+test("protect: a nested plain git repo leaves the outer repo's globs on the outer path", () => {
+  const repo = makeRepo({ files: { "krites.toml": 'version = 1\n\n[protect]\nglobs = ["fixtures/**", "target/wt/x/keep/**"]\n' } });
+  const nested = nestedIn(repo, "target/wt/x", {});
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  assert.strictEqual(decide(input(path.join(nested, "fixtures", "a.txt")), roots), null);
+  assert.match(decide(input(path.join(nested, "keep", "a.txt")), roots), /target\/wt\/x\/keep\/a\.txt is protected/);
+});
+
+test("protect: a nested root whose config does not load blocks edits below it", () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  const broken = nestedIn(repo, "target/wt/broken", { "krites.toml": "version = 1\n\n[checks]\nnope = 1\n" });
+  const own = (rel) => `^Blocked: ${rel} is a Krites root of its own whose config cannot be used: `;
+  const fix = (rel) => ` Fix it from a session started in ${rel}\\.$`;
+  assert.match(decide(input(path.join(broken, "src", "a.rs")), roots), new RegExp(`${own("target/wt/broken")}krites\\.toml line 4: .*${fix("target/wt/broken")}`));
+  const gated = nestedIn(repo, "target/wt/gated", { ".krites/session-head": `${"a".repeat(40)}\n` });
+  assert.match(decide(input(path.join(gated, "src", "a.rs")), roots), new RegExp(`${own("target/wt/gated")}.*gated before[^]*README on how to stop gating a repo\\.$`));
+  assert.strictEqual(decide(input(path.join(repo, "src", "a.rs")), roots), null);
+});
+
+test("protect: a nested root's relative path folds trailing dots and spaces", () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const nested = nestedIn(repo, "target/wt/x", { "krites.toml": FIXTURES_ONLY });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  assert.match(decide(input(path.join(nested, "fixtures.", "a.txt")), roots), /: fixtures\/a\.txt is protected/);
+  assert.match(decide(input(path.join(nested, "fixtures ", "a.txt")), roots), /: fixtures\/a\.txt is protected/);
+});
+
+test("protect: an unprotected file in a nested root is allowed", () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const nested = nestedIn(repo, "target/wt/x", { "krites.toml": FIXTURES_ONLY });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  assert.strictEqual(decide(input(path.join(nested, "src", "a.rs")), roots), null);
+  assert.strictEqual(decide(input(path.join(nested, "new", "deep", "b.md")), roots), null);
+});
+
+const touchedLines = (repo) => {
+  try {
+    return fs.readFileSync(path.join(repo, ".krites", "touched"), "utf8").split("\n").filter(Boolean);
+  } catch {
+    return [];
+  }
+};
+
+const committed = (dir) => (git(dir, "add", "-A"), git(dir, "commit", "-qm", "init"), dir);
+const editAs = (sessionId, file, cwd) => ({ ...edit({ file_path: file }, cwd), session_id: sessionId });
+
+test("protect: an allowed edit in a nested root records it once per session, with its HEAD, and writes nothing in it", async () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const nested = committed(nestedIn(repo, "target/wt/x", { "krites.toml": FIXTURES_ONLY }));
+  assertDeny(await runHook(PROTECT, editAs("s1", path.join(nested, "fixtures", "a.txt"), repo)), /fixtures\/a\.txt is protected/);
+  assert.deepStrictEqual(touchedLines(repo), [], "a denied edit records nothing");
+  assert.deepStrictEqual(await runHook(PROTECT, editAs("s1", path.join(nested, "src", "a.rs"), repo)), SILENT);
+  const line = `s1\t${fs.realpathSync.native(nested)}\t${head(nested)}`;
+  assert.deepStrictEqual(touchedLines(repo), [line]);
+  git(nested, "commit", "-q", "--allow-empty", "-m", "later");
+  assert.deepStrictEqual(await runHook(PROTECT, editAs("s1", path.join(nested, "src", "b.rs"), repo)), SILENT);
+  assert.deepStrictEqual(touchedLines(repo), [line], "the head at the first touch stays");
+  assert.ok(!fs.existsSync(path.join(nested, ".krites")), "nothing is written in the nested root");
+});
+
+test("protect: an edit in the session root itself, or with no usable session id, records nothing", async () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const nested = committed(nestedIn(repo, "target/wt/x", { "krites.toml": FIXTURES_ONLY }));
+  assert.deepStrictEqual(await runHook(PROTECT, editAs("s1", path.join(repo, "src", "a.rs"), repo)), SILENT);
+  for (const id of [undefined, 7, "", "a b", "../x", "s\t1", "x".repeat(65)]) {
+    assert.deepStrictEqual(await runHook(PROTECT, editAs(id, path.join(nested, "src", "a.rs"), repo)), SILENT);
+  }
+  assert.deepStrictEqual(touchedLines(repo), []);
+});
+
+test("protect: a record that cannot be written leaves the decision alone", async () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const nested = committed(nestedIn(repo, "target/wt/x", { "krites.toml": FIXTURES_ONLY }));
+  fs.mkdirSync(path.join(repo, ".krites", "touched", "held"), { recursive: true });
+  assert.deepStrictEqual(await runHook(PROTECT, editAs("s1", path.join(nested, "src", "a.rs"), repo)), SILENT);
+  assertDeny(await runHook(PROTECT, editAs("s1", path.join(nested, "fixtures", "a.txt"), repo)), /fixtures\/a\.txt is protected/);
+});
+
+test("protect: past 4096 lines the hook still only appends, and leaves the trim to the gate", async () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const nested = committed(nestedIn(repo, "target/wt/x", { "krites.toml": FIXTURES_ONLY }));
+  assert.deepStrictEqual(await runHook(PROTECT, editAs("s1", path.join(nested, "src", "a.rs"), repo)), SILENT);
+  const others = Array.from({ length: 4200 }, (_, i) => `o${i}\t${path.join(repo, "target", "wt", `y${i}`)}\t`);
+  fs.appendFileSync(path.join(repo, ".krites", "touched"), `${others.join("\n")}\n`);
+  const second = committed(nestedIn(repo, "target/wt/z", { "krites.toml": FIXTURES_ONLY }));
+  assert.deepStrictEqual(await runHook(PROTECT, editAs("s1", path.join(second, "src", "a.rs"), repo)), SILENT);
+  const lines = touchedLines(repo);
+  assert.strictEqual(lines.length, 4202);
+  assert.deepStrictEqual(lines.slice(1, 4201), others);
+  assert.strictEqual(lines[4201], `s1\t${fs.realpathSync.native(second)}\t${head(second)}`);
+  assert.deepStrictEqual(fs.readdirSync(path.join(repo, ".krites")).sort(), [".gitignore", "touched"], "no temp file");
+});
+
+// A file symlink needs a privilege Windows rarely grants, so a junction to a folder stands in for it there.
+function plantLink(at, outside) {
+  try {
+    fs.writeFileSync(path.join(outside, "victim.txt"), "kept\n");
+    fs.symlinkSync(path.join(outside, "victim.txt"), at, "file");
+  } catch {
+    fs.symlinkSync(outside, at, "junction");
+  }
+}
+
+test("protect: a link planted at the touched file or at .krites gets nothing written through it and is left in place", async () => {
+  for (const at of [".krites/touched", ".krites"]) {
+    const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+    const nested = committed(nestedIn(repo, "target/wt/x", { "krites.toml": FIXTURES_ONLY }));
+    const outside = makeDir();
+    if (at !== ".krites") fs.mkdirSync(path.join(repo, ".krites"));
+    plantLink(path.join(repo, ...at.split("/")), outside);
+    assert.deepStrictEqual(await runHook(PROTECT, editAs("s1", path.join(nested, "src", "a.rs"), repo)), SILENT);
+    assert.ok(fs.lstatSync(path.join(repo, ...at.split("/"))).isSymbolicLink(), `${at} is not replaced`);
+    const left = fs.readdirSync(outside);
+    assert.ok(left.length === 0 || (left.length === 1 && fs.readFileSync(path.join(outside, "victim.txt"), "utf8") === "kept\n"), `nothing lands through ${at}`);
+  }
+});
+
+test("protect: a .krites that is a file is left alone and the edit is still allowed", async () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG, ".krites": "not a folder\n" } });
+  const nested = committed(nestedIn(repo, "target/wt/x", { "krites.toml": FIXTURES_ONLY }));
+  assert.deepStrictEqual(await runHook(PROTECT, editAs("s1", path.join(nested, "src", "a.rs"), repo)), SILENT);
+  assert.strictEqual(fs.readFileSync(path.join(repo, ".krites"), "utf8"), "not a folder\n");
+});
+
+test("protect: records from hook processes running at once all survive", async () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  fs.mkdirSync(path.join(repo, ".krites"));
+  const nested = Array.from({ length: 8 }, (_, i) => committed(nestedIn(repo, `target/wt/x${i}`, { "krites.toml": FIXTURES_ONLY })));
+  const results = await Promise.all(nested.map((dir) => runHook(PROTECT, editAs("s1", path.join(dir, "src", "a.rs"), repo))));
+  for (const result of results) assert.deepStrictEqual(result, SILENT);
+  assert.deepStrictEqual(touchedLines(repo).sort(), nested.map((dir) => `s1\t${fs.realpathSync.native(dir)}\t${head(dir)}`).sort());
+});
+
+test("protect: a deny on a later path key records nothing for the earlier one, and a repo with no commits records an empty head", async () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const nested = committed(nestedIn(repo, "target/wt/x", { "krites.toml": FIXTURES_ONLY }));
+  const both = { ...edit({ file_path: path.join(nested, "src", "a.rs"), notebook_path: path.join(nested, "fixtures", "a.ipynb") }, repo), session_id: "s1" };
+  assertDeny(await runHook(PROTECT, both), /fixtures\/a\.ipynb is protected/);
+  assert.deepStrictEqual(touchedLines(repo), []);
+  const fresh = nestedIn(repo, "target/wt/fresh", { "krites.toml": FIXTURES_ONLY });
+  assert.deepStrictEqual(await runHook(PROTECT, editAs("s1", path.join(fresh, "src", "a.rs"), repo)), SILENT);
+  assert.deepStrictEqual(touchedLines(repo), [`s1\t${fs.realpathSync.native(fresh)}\t`]);
 });

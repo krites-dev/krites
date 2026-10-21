@@ -5,7 +5,7 @@ const path = require("node:path");
 const { test } = require("node:test");
 
 const { readBlockCount, writeBlockCount } = require("../lib/state.js");
-const { ABSOLUTE, assertBlock, configure, git, head, makeDir, makeRepo, runHook, script, toml } = require("./helpers.js");
+const { ABSOLUTE, assertBlock, configure, git, head, makeDir, makeRepo, runCli, runHook, script, toml } = require("./helpers.js");
 
 const GATE = path.join(__dirname, "..", "hooks", "gate.js");
 const SESSION = path.join(__dirname, "..", "hooks", "session.js");
@@ -87,6 +87,39 @@ test("session: a spent budget is reported in one line, and every start resets th
   assert.strictEqual(readBlockCount(repo), 0, "the counter is reset either way");
 });
 
+test("session: a /clear reports a spent budget and resets the counter, but keeps the baseline and the approved config", async () => {
+  const repo = configure(makeRepo({ files: { "a.txt": "a\n" } }), { commands: [script("")] });
+  await runHook(SESSION, start(repo), { cwd: repo });
+  const before = baseline(repo);
+  const hash = fs.readFileSync(path.join(repo, ".krites", "config-hash"), "utf8");
+  fs.writeFileSync(path.join(repo, "a.txt"), "b\n");
+  git(repo, "commit", "-qam", "b");
+  fs.appendFileSync(path.join(repo, "krites.toml"), "\n");
+  writeBlockCount(repo, 4);
+  const clear = { ...start(repo), source: "clear" };
+
+  assert.strictEqual(message(await runHook(SESSION, clear, { cwd: repo })), GAVE_UP);
+  assert.strictEqual(readBlockCount(repo), 0);
+  assert.strictEqual(baseline(repo), before, "work since the last stop stays judged: an interrupted turn ran no gate");
+  assert.strictEqual(fs.readFileSync(path.join(repo, ".krites", "config-hash"), "utf8"), hash, "a krites.toml changed since startup stays unapproved");
+
+  writeBlockCount(repo, 2);
+  assert.deepStrictEqual(await runHook(SESSION, clear, { cwd: repo }), SILENT);
+  assert.strictEqual(readBlockCount(repo), 0);
+});
+
+test("session: a /clear in a root whose config does not parse still says Krites is not running", async () => {
+  const repo = configure(makeRepo({ files: { "a.txt": "a\n" } }), "version = 1\n\n[checks]\nnope = 1\n");
+  assert.strictEqual(message(await runHook(SESSION, { ...start(repo), source: "clear" }, { cwd: repo })), NOT_PARSED);
+});
+
+test("session: a /clear in a repo with no krites.toml, or one with no checks, says nothing", async () => {
+  const bare = makeRepo({ files: { "a.txt": "a\n" } });
+  assert.deepStrictEqual(await runHook(SESSION, { ...start(bare), source: "clear" }, { cwd: bare }), SILENT);
+  const empty = configure(makeRepo({ files: { "a.txt": "a\n" } }), { commands: [] });
+  assert.deepStrictEqual(await runHook(SESSION, { ...start(empty), source: "clear" }, { cwd: empty }), SILENT);
+});
+
 test("session: a spent budget and an empty command list are two lines", async () => {
   const repo = configure(makeRepo({ files: { "a.txt": "a\n" } }), { commands: [] });
   writeBlockCount(repo, 4);
@@ -162,4 +195,51 @@ test("session: a repo with no commits writes an empty baseline", async () => {
 
 test("session: malformed input is reported to the user and never blocks the session", async () => {
   assert.strictEqual(message(await runHook(SESSION, "{not json")), FAILED("could not read its input"));
+});
+
+test("session: a fresh startup drops an approval, even one whose baseline matches again", async () => {
+  const repo = configure(makeRepo({ files: { "a.txt": "a\n", "secrets/rule.md": "rule\n" } }), { commands: [script("")], globs: ["secrets/**"] });
+  await runHook(SESSION, start(repo), { cwd: repo });
+  const first = baseline(repo);
+  fs.writeFileSync(path.join(repo, "secrets", "rule.md"), "sanctioned\n");
+  git(repo, "commit", "-q", "-am", "sanctioned");
+  await runCli(["approve"], { cwd: repo });
+  await runCli(["approve", "--write"], { cwd: repo });
+  const approved = path.join(repo, ".krites", "approved-head");
+  assert.ok(fs.existsSync(approved), "the approval was written");
+
+  git(repo, "reset", "-q", "--hard", first);
+  await runHook(SESSION, start(repo), { cwd: repo });
+  assert.strictEqual(baseline(repo), first);
+  assert.strictEqual(fs.existsSync(approved), false);
+});
+
+test("session: a fresh startup drops an approval even when krites.toml does not parse", async () => {
+  const repo = configure(makeRepo({ files: { "a.txt": "a\n", "secrets/rule.md": "rule\n" } }), { commands: [script("")], globs: ["secrets/**"] });
+  await runHook(SESSION, start(repo), { cwd: repo });
+  fs.writeFileSync(path.join(repo, "secrets", "rule.md"), "sanctioned\n");
+  git(repo, "commit", "-q", "-am", "sanctioned");
+  await runCli(["approve"], { cwd: repo });
+  await runCli(["approve", "--write"], { cwd: repo });
+  const approved = path.join(repo, ".krites", "approved-head");
+  assert.ok(fs.existsSync(approved), "the approval was written");
+
+  fs.writeFileSync(path.join(repo, "krites.toml"), "version = 1\n\n[checks]\nnope = 1\n");
+  assert.strictEqual(message(await runHook(SESSION, start(repo), { cwd: repo })), NOT_PARSED);
+  assert.strictEqual(fs.existsSync(approved), false);
+});
+
+test("session: a /clear keeps an approval along with the baseline it was made against", async () => {
+  const repo = configure(makeRepo({ files: { "a.txt": "a\n", "secrets/rule.md": "rule\n" } }), { commands: [script("")], globs: ["secrets/**"] });
+  await runHook(SESSION, start(repo), { cwd: repo });
+  fs.writeFileSync(path.join(repo, "secrets", "rule.md"), "sanctioned\n");
+  git(repo, "commit", "-q", "-am", "sanctioned");
+  await runCli(["approve"], { cwd: repo });
+  await runCli(["approve", "--write"], { cwd: repo });
+  const approved = path.join(repo, ".krites", "approved-head");
+  const pair = fs.readFileSync(approved, "utf8");
+
+  assert.deepStrictEqual(await runHook(SESSION, { ...start(repo), source: "clear" }, { cwd: repo }), SILENT);
+  assert.strictEqual(fs.readFileSync(approved, "utf8"), pair);
+  assert.deepStrictEqual(await runHook(GATE, stop(repo), { cwd: repo }), SILENT, "the next stop is still excused");
 });

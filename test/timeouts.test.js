@@ -31,8 +31,9 @@ test("timeouts: the fast hooks get 10 s, above the deadline their input reader u
   assert.ok(STDIN_DEADLINE_MS / 1000 <= 5, "the stdin deadline answers well inside the 10 s hook timeout");
 });
 
-test("timeouts: the Stop entry runs gate.js and SessionStart matches startup only", () => {
+test("timeouts: the Stop entry runs gate.js and SessionStart matches startup and /clear, never resume or compact", () => {
   assert.deepStrictEqual(hooks.Stop[0].hooks[0].args, ["${CLAUDE_PLUGIN_ROOT}/hooks/gate.js"]);
   assert.deepStrictEqual(hooks.SessionStart[0].hooks[0].args, ["${CLAUDE_PLUGIN_ROOT}/hooks/session.js"]);
-  assert.strictEqual(hooks.SessionStart[0].matcher, "startup");
+  assert.strictEqual(hooks.SessionStart.length, 1);
+  assert.strictEqual(hooks.SessionStart[0].matcher, "startup|clear");
 });

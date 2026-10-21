@@ -7,7 +7,7 @@ const { test } = require("node:test");
 
 const { scrub, TOKEN } = require("../lib/scrub.js");
 const { writeBlockCount } = require("../lib/state.js");
-const { ABSOLUTE, configure, FAKE, hookText, makeDir, makeRepo, runCli, runHook, script, seed, textOf, tmp, toml } = require("./helpers.js");
+const { ABSOLUTE, configure, FAKE, git, hookText, makeDir, makeRepo, runCli, runHook, script, seed, textOf, tmp, toml } = require("./helpers.js");
 
 const HOOKS = path.join(__dirname, "..", "hooks");
 const PLUGIN = path.join(__dirname, "..");
@@ -122,6 +122,21 @@ test("output: a timed-out gate and a no_checks gate keep the same guarantees", {
   fs.writeFileSync(path.join(quiet, "a.txt"), "changed\n");
   assertClean("gate no_checks", await runHook(hook("gate"), stop(quiet), { cwd: quiet }));
   assert.strictEqual(JSON.parse(fs.readFileSync(path.join(quiet, ".krites", "last-run.json"), "utf8")).verdict, "no_checks");
+});
+
+test("output: a nested root the session edited keeps the same guarantees", { timeout: 60000 }, async () => {
+  const repo = makeRepo({ files: { "a.txt": "a\n", ".gitignore": "target/\n" } });
+  configure(repo, { commands: [script("process.exit(0)")] });
+  seed(repo);
+  const nested = path.join(repo, "target", "wt", "x");
+  fs.mkdirSync(nested, { recursive: true });
+  git(nested, "init", "-q");
+  configure(nested, { commands: [script(`console.log("failing in " + process.cwd()); process.exit(2);`)] });
+  const touch = { ...edit(path.join(nested, "a.txt"), repo), session_id: "s1" };
+  assertClean("protect nested allow", await runHook(hook("protect"), touch, { cwd: repo }));
+  fs.writeFileSync(path.join(nested, "a.txt"), "a\n");
+  const out = assertClean("gate nested block", await runHook(hook("gate"), stop(repo), { cwd: repo }));
+  assert.match(out, /^In target\/wt\/x: Krites refuted the stop: /m);
 });
 
 test("output: every command path exits 0 with no absolute path, no command line and no receipt that leaks one", { timeout: 120000 }, async () => {

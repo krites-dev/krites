@@ -5,7 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { test } = require("node:test");
 
-const { readBaseline, readBlockCount, readConfigHash, writeBlockCount } = require("../lib/state.js");
+const { readBaseline, readBlockCount, readConfigHash, trimTouched, writeBlockCount } = require("../lib/state.js");
 const { ABSOLUTE, assertBlock, configure, FAKE, fromTmp, git, head, makeDir, makeRepo, runCli, runHook, script, seed, textOf, tmp, toml } = require("./helpers.js");
 
 const GATE = path.join(__dirname, "..", "hooks", "gate.js");
@@ -870,4 +870,300 @@ test("gate: a stop on the tree /krites:verify passed carries its slow results, a
   assertBlock(await runHook(GATE, stop(refuted), { cwd: refuted }), /check\d+\.js/);
   const run = lastRun(refuted);
   assert.deepStrictEqual([run.verdict, run.checks.length], ["refuted", 1], "a refuted stop carries nothing");
+});
+
+// A session root R that ignores target/, and a committed krites root at R/target/wt/x that session s1's protect hook recorded.
+function touchedNested(options, { sessionId = "s1" } = {}) {
+  const repo = makeRepo({ files: { "a.txt": "a\n", ".gitignore": "target/\n" } });
+  configure(repo, { commands: [pass()] });
+  seed(repo);
+  const nested = path.join(repo, "target", "wt", "x");
+  fs.mkdirSync(nested, { recursive: true });
+  git(nested, "init", "-q");
+  fs.writeFileSync(path.join(nested, "a.txt"), "a\n");
+  git(nested, "add", "-A");
+  git(nested, "commit", "-qm", "init");
+  configure(nested, options);
+  fs.appendFileSync(path.join(repo, ".krites", "touched"), `${sessionId}\t${nested}\t${head(nested)}\n`);
+  return { repo, nested };
+}
+
+test("gate: a nested root the session edited is judged from the session root, named by its relative path", async () => {
+  const { repo, nested } = touchedNested({ commands: [fail()] });
+  fs.writeFileSync(path.join(nested, "a.txt"), "changed\n");
+  assert.deepStrictEqual(await runHook(GATE, stop(repo, { session_id: "s2" })), SILENT, "another session never edited it");
+  assert.ok(!fs.existsSync(path.join(nested, ".krites")), "nothing is written in the nested root before its first judgement");
+  assertBlock(await runHook(GATE, stop(repo)), /^In target\/wt\/x: Krites refuted the stop: /);
+  assert.strictEqual(readBlockCount(nested), 1, "the block is charged to the nested root");
+  assert.strictEqual(readBlockCount(repo), 0);
+});
+
+test("gate: a touched root outside the session root, or no longer a krites root, is skipped and nothing is written there", async () => {
+  const { repo } = touchedNested({ commands: [pass()] });
+  const outside = makeRepo({ files: { "a.txt": "a\n" } });
+  configure(outside, { commands: [fail()] });
+  fs.writeFileSync(path.join(outside, "a.txt"), "changed\n");
+  const gone = path.join(repo, "target", "wt", "gone");
+  const plain = path.join(repo, "target", "wt", "plain");
+  fs.mkdirSync(plain, { recursive: true });
+  git(plain, "init", "-q");
+  fs.writeFileSync(path.join(plain, "a.txt"), "a\n");
+  const lines = [outside, gone, plain, repo].map((root) => `s1\t${root}\t\n`).join("");
+  fs.appendFileSync(path.join(repo, ".krites", "touched"), lines);
+  assert.deepStrictEqual(await runHook(GATE, stop(repo)), SILENT);
+  for (const dir of [outside, plain]) assert.ok(!fs.existsSync(path.join(dir, ".krites")));
+  assert.ok(!fs.existsSync(gone));
+});
+
+test("gate: a protected path committed in the nested root after the first touch refutes the stop", async () => {
+  const { repo, nested } = touchedNested({ commands: [pass()], globs: ["fixtures/**"] });
+  fs.mkdirSync(path.join(nested, "fixtures"));
+  fs.writeFileSync(path.join(nested, "fixtures", "a.txt"), "a\n");
+  git(nested, "add", "-A");
+  git(nested, "commit", "-qm", "fixture");
+  const reason = assertBlock(await runHook(GATE, stop(repo)), /^In target\/wt\/x: Krites refuted the stop: protected path changed: fixtures\/a\.txt\./);
+  assert.ok(reason.endsWith("review it with /krites:approve from a session started in target/wt/x."), reason);
+});
+
+test("gate: a touched root that passes records its own baseline and count, and its next clean stop skips", async () => {
+  const { repo, nested } = touchedNested({ commands: [["git", "rev-parse", "--verify", "-q", "refs/tags/ok"]] });
+  fs.writeFileSync(path.join(nested, "a.txt"), "changed\n");
+  assertBlock(await runHook(GATE, stop(repo)), /^In target\/wt\/x: Krites refuted the stop: git rev-parse/);
+  assert.strictEqual(readBlockCount(nested), 1);
+  git(nested, "commit", "-qam", "work");
+  git(nested, "tag", "ok");
+  assert.deepStrictEqual(await runHook(GATE, stop(repo)), SILENT);
+  assert.strictEqual(readBaseline(nested), head(nested));
+  assert.strictEqual(readBlockCount(nested), 0);
+  git(nested, "tag", "-d", "ok");
+  assert.deepStrictEqual(await runHook(GATE, stop(repo)), SILENT, "a clean tree at its own baseline skips");
+});
+
+const PROTECT = path.join(__dirname, "..", "hooks", "protect.js");
+
+test("gate: an edit made with the cwd inside the nested root is recorded under the project root and judged from it", async () => {
+  const { repo, nested } = touchedNested({ commands: [fail()] });
+  fs.writeFileSync(path.join(repo, ".krites", "touched"), "");
+  const write = { hook_event_name: "PreToolUse", tool_name: "Write", session_id: "s1", cwd: nested, tool_input: { file_path: path.join(nested, "src", "a.rs") } };
+  assert.deepStrictEqual(await runHook(PROTECT, write, { env: { CLAUDE_PROJECT_DIR: repo } }), SILENT);
+  assert.ok(!fs.existsSync(path.join(nested, ".krites")), "nothing is written in the nested root");
+  fs.mkdirSync(path.join(nested, "src"));
+  fs.writeFileSync(path.join(nested, "src", "a.rs"), "fn main() {}\n");
+  assertBlock(await runHook(GATE, stop(repo)), /^In target\/wt\/x: Krites refuted the stop: /);
+});
+
+test("gate: a touched root that is also the stop's cwd root keeps its recorded head as the baseline", async () => {
+  const { repo, nested } = touchedNested({ commands: [pass()], globs: ["fixtures/**"] });
+  fs.mkdirSync(path.join(nested, "fixtures"));
+  fs.writeFileSync(path.join(nested, "fixtures", "a.txt"), "a\n");
+  git(nested, "add", "-A");
+  git(nested, "commit", "-qm", "fixture");
+  const reason = assertBlock(await runHook(GATE, stop(nested), { env: { CLAUDE_PROJECT_DIR: repo } }), /^Krites refuted the stop: protected path changed: fixtures\/a\.txt\./);
+  assert.doesNotMatch(reason, /^In /, "a root of the stop itself carries no prefix");
+});
+
+test("gate: a touched line whose folder now resolves to another root is skipped", async () => {
+  const { repo, nested } = touchedNested({ commands: [fail()] });
+  fs.writeFileSync(path.join(nested, "a.txt"), "changed\n");
+  fs.writeFileSync(path.join(repo, ".krites", "touched"), `s1\t${path.join(nested, "sub")}\t\n`);
+  fs.mkdirSync(path.join(nested, "sub"));
+  assert.deepStrictEqual(await runHook(GATE, stop(repo)), SILENT, "sub's root is x, which the session never edited");
+  assert.ok(!fs.existsSync(path.join(nested, ".krites")));
+});
+
+test("gate: a touched line through a link inside the session root to a repo outside it is skipped", async () => {
+  const { repo } = touchedNested({ commands: [pass()] });
+  const outside = makeRepo({ files: { "a.txt": "a\n" } });
+  configure(outside, { commands: [fail()] });
+  fs.writeFileSync(path.join(outside, "a.txt"), "changed\n");
+  const link = path.join(repo, "target", "wt", "link");
+  fs.symlinkSync(outside, link, "junction");
+  fs.writeFileSync(path.join(repo, ".krites", "touched"), `s1\t${link}\t\n`);
+  assert.deepStrictEqual(await runHook(GATE, stop(repo)), SILENT);
+  assert.ok(!fs.existsSync(path.join(outside, ".krites")));
+  fs.unlinkSync(link);
+});
+
+test("gate: a krites.toml committed in the nested root after the first touch refutes the stop", async () => {
+  const { repo, nested } = touchedNested({ commands: [pass()] });
+  configure(nested, { commands: [pass()], maxBlocks: 5 });
+  assertBlock(await runHook(GATE, stop(repo)), /^In target\/wt\/x: Krites refuted the stop: protected path changed: krites\.toml\. If you changed it yourself, run \/krites:init from a session started in target\/wt\/x to approve it\.$/);
+});
+
+test("gate: a nested krites.toml that stops parsing after the first touch is held with the prefix", async () => {
+  const { repo, nested } = touchedNested({ commands: [pass()] });
+  fs.writeFileSync(path.join(nested, "krites.toml"), BROKEN);
+  const reason = assertBlock(await runHook(GATE, stop(repo)), /^In target\/wt\/x: Krites blocked the stop: /);
+  assert.match(reason, BROKEN_LINE);
+  assert.match(reason, /Run \/krites:init from a session started in target\/wt\/x\.$/);
+  assert.strictEqual(readBlockCount(nested), 0, "a config error spends nothing");
+});
+
+test("gate: records from hook processes running at once past the cap all survive, and a stop past 4096 trims to 2048", async () => {
+  const { repo } = touchedNested({ commands: [pass()] });
+  const file = path.join(repo, ".krites", "touched");
+  const others = Array.from({ length: 4200 }, (_, i) => `o${i}\t${path.join(repo, "target", "wt", `y${i}`)}\t`);
+  fs.writeFileSync(file, `${others.join("\n")}\n`);
+  const nested = Array.from({ length: 8 }, (_, i) => {
+    const dir = path.join(repo, "target", "wt", `n${i}`);
+    fs.mkdirSync(dir, { recursive: true });
+    git(dir, "init", "-q");
+    configure(dir, { commands: [pass()] });
+    return dir;
+  });
+  const write = (dir) => ({ hook_event_name: "PreToolUse", tool_name: "Write", session_id: "s1", cwd: repo, tool_input: { file_path: path.join(dir, "a.txt") } });
+  const results = await Promise.all(nested.map((dir) => runHook(PROTECT, write(dir))));
+  for (const result of results) assert.deepStrictEqual(result, SILENT);
+  const own = nested.map((dir) => `s1\t${dir}\t${head(dir)}`).sort();
+  const read = () => fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
+  assert.deepStrictEqual(read().filter((line) => line.startsWith("s1\t")).sort(), own, "every concurrent record survives");
+  assert.strictEqual(read().length, 4208);
+  assert.deepStrictEqual(await runHook(GATE, stop(repo)), SILENT);
+  const trimmed = read();
+  assert.strictEqual(trimmed.length, 2048);
+  assert.deepStrictEqual(trimmed.filter((line) => line.startsWith("s1\t")).sort(), own);
+  assert.deepStrictEqual(trimmed.filter((line) => !line.startsWith("s1\t")), others.slice(2160));
+  assert.deepStrictEqual(fs.readdirSync(path.join(repo, ".krites")).filter((name) => name.includes("touched")), ["touched"], "no temp file is left");
+});
+
+test("gate: a project dir that no krites root holds anchors the record on the outermost session root", async () => {
+  const parent = makeDir();
+  const repo = path.join(parent, "r");
+  fs.mkdirSync(repo);
+  fs.writeFileSync(path.join(repo, "a.txt"), "a\n");
+  fs.writeFileSync(path.join(repo, ".gitignore"), "target/\n");
+  git(repo, "init", "-q");
+  git(repo, "add", "-A");
+  git(repo, "commit", "-qm", "init");
+  configure(repo, { commands: [pass()] });
+  seed(repo);
+  const nested = path.join(repo, "target", "wt", "x");
+  fs.mkdirSync(nested, { recursive: true });
+  git(nested, "init", "-q");
+  configure(nested, { commands: [fail()] });
+  const write = { hook_event_name: "PreToolUse", tool_name: "Write", session_id: "s1", cwd: repo, tool_input: { file_path: path.join(nested, "a.txt") } };
+  assert.deepStrictEqual(await runHook(PROTECT, write, { env: { CLAUDE_PROJECT_DIR: parent } }), SILENT);
+  fs.writeFileSync(path.join(nested, "a.txt"), "a\n");
+  assertBlock(await runHook(GATE, stop(repo), { env: { CLAUDE_PROJECT_DIR: parent } }), /^In target\/wt\/x: Krites refuted the stop: /);
+});
+
+test("gate: a line recorded with an empty head gives way to the session's first line for that root with a head", async () => {
+  const repo = makeRepo({ files: { "a.txt": "a\n", ".gitignore": "target/\n" } });
+  configure(repo, { commands: [pass()] });
+  seed(repo);
+  const nested = path.join(repo, "target", "wt", "x");
+  fs.mkdirSync(nested, { recursive: true });
+  git(nested, "init", "-q");
+  fs.writeFileSync(path.join(nested, "krites.toml"), toml({ commands: [pass()], globs: ["fixtures/**"] }));
+  const write = (rel) => ({ hook_event_name: "PreToolUse", tool_name: "Write", session_id: "s1", cwd: repo, tool_input: { file_path: path.join(nested, rel) } });
+  assert.deepStrictEqual(await runHook(PROTECT, write("a.txt")), SILENT, "no commit yet, so the head is empty");
+  git(nested, "add", "-A");
+  git(nested, "commit", "-qm", "init");
+  const first = head(nested);
+  assert.deepStrictEqual(await runHook(PROTECT, write("b.txt")), SILENT);
+  assert.deepStrictEqual(await runHook(PROTECT, write("c.txt")), SILENT);
+  const lines = fs.readFileSync(path.join(repo, ".krites", "touched"), "utf8").split("\n").filter(Boolean);
+  assert.deepStrictEqual(lines, [`s1\t${nested}\t`, `s1\t${nested}\t${first}`], "a line with a head is recorded once");
+  fs.mkdirSync(path.join(nested, "fixtures"));
+  fs.writeFileSync(path.join(nested, "fixtures", "a.txt"), "a\n");
+  git(nested, "add", "-A");
+  git(nested, "commit", "-qm", "fixture");
+  assertBlock(await runHook(GATE, stop(repo)), /^In target\/wt\/x: Krites refuted the stop: protected path changed: fixtures\/a\.txt\./);
+});
+
+test("gate: a stop leaves a touched file of up to 4096 lines as it is", async () => {
+  const { repo } = touchedNested({ commands: [pass()] });
+  const file = path.join(repo, ".krites", "touched");
+  const lines = Array.from({ length: 4096 }, (_, i) => `o${i}\t${path.join(repo, "target", "wt", `y${i}`)}\t`);
+  fs.writeFileSync(file, `${lines.join("\n")}\n`);
+  assert.deepStrictEqual(await runHook(GATE, stop(repo)), SILENT);
+  assert.strictEqual(fs.readFileSync(file, "utf8"), `${lines.join("\n")}\n`);
+});
+
+test("gate: a trim whose rename fails leaves the lines and no temp file", () => {
+  const { repo } = touchedNested({ commands: [pass()] });
+  const file = path.join(repo, ".krites", "touched");
+  const text = `${Array.from({ length: 4100 }, (_, i) => `o${i}\t${path.join(repo, "target", "wt", `y${i}`)}\t`).join("\n")}\n`;
+  fs.writeFileSync(file, text);
+  const { renameSync } = fs;
+  fs.renameSync = () => {
+    throw Object.assign(new Error("rename failed"), { code: "EIO" });
+  };
+  try {
+    assert.throws(() => trimTouched(repo, "s1"), /rename failed/);
+  } finally {
+    fs.renameSync = renameSync;
+  }
+  assert.strictEqual(fs.readFileSync(file, "utf8"), text);
+  assert.deepStrictEqual(fs.readdirSync(path.join(repo, ".krites")).filter((name) => name.includes("touched")), ["touched"]);
+});
+
+test("gate: a project root that does not hold the edited root leaves the record to the session root that does", async () => {
+  const project = makeRepo({ files: { "a.txt": "a\n" } });
+  configure(project, { commands: [pass()] });
+  seed(project);
+  const { repo, nested } = touchedNested({ commands: [fail()] });
+  fs.writeFileSync(path.join(repo, ".krites", "touched"), "");
+  const write = { hook_event_name: "PreToolUse", tool_name: "Write", session_id: "s1", cwd: repo, tool_input: { file_path: path.join(nested, "b.txt") } };
+  assert.deepStrictEqual(await runHook(PROTECT, write, { env: { CLAUDE_PROJECT_DIR: project } }), SILENT);
+  assert.ok(!fs.existsSync(path.join(project, ".krites", "touched")), "nothing is recorded in the project root");
+  fs.writeFileSync(path.join(nested, "b.txt"), "b\n");
+  assertBlock(await runHook(GATE, stop(repo), { env: { CLAUDE_PROJECT_DIR: project } }), /^In target\/wt\/x: Krites refuted the stop: /);
+});
+
+test("gate: a trim whose temp write fails after the open leaves the lines and no temp file", () => {
+  const { repo } = touchedNested({ commands: [pass()] });
+  const file = path.join(repo, ".krites", "touched");
+  const text = `${Array.from({ length: 4100 }, (_, i) => `o${i}\t${path.join(repo, "target", "wt", `y${i}`)}\t`).join("\n")}\n`;
+  fs.writeFileSync(file, text);
+  const { writeFileSync } = fs;
+  fs.writeFileSync = (target, data, options) => {
+    if (!String(target).includes(".touched.")) return writeFileSync(target, data, options);
+    writeFileSync(target, "", options);
+    throw Object.assign(new Error("write failed"), { code: "EIO" });
+  };
+  try {
+    assert.throws(() => trimTouched(repo, "s1"), /write failed/);
+  } finally {
+    fs.writeFileSync = writeFileSync;
+  }
+  assert.strictEqual(fs.readFileSync(file, "utf8"), text);
+  assert.deepStrictEqual(fs.readdirSync(path.join(repo, ".krites")).filter((name) => name.includes("touched")), ["touched"]);
+});
+
+test("gate: a trim that fails inside a stop still judges the touched root", async () => {
+  const { gate } = require(GATE);
+  const { repo, nested } = touchedNested({ commands: [fail()] });
+  fs.writeFileSync(path.join(nested, "a.txt"), "changed\n");
+  const others = Array.from({ length: 4100 }, (_, i) => `o${i}\t${path.join(repo, "target", "wt", `y${i}`)}\t`);
+  fs.appendFileSync(path.join(repo, ".krites", "touched"), `${others.join("\n")}\n`);
+  const { renameSync } = fs;
+  fs.renameSync = (from, to) => {
+    if (String(from).includes(".touched.")) throw Object.assign(new Error("rename failed"), { code: "EIO" });
+    return renameSync(from, to);
+  };
+  try {
+    assert.match(await fromTmp(() => gate(stop(repo), { projectDir: repo })), /^In target\/wt\/x: Krites refuted the stop: /);
+  } finally {
+    fs.renameSync = renameSync;
+  }
+  assert.strictEqual(fs.readFileSync(path.join(repo, ".krites", "touched"), "utf8").split("\n").filter(Boolean).length, 4101, "the lines stay");
+});
+
+test("gate: a changed protected path is refuted with a reason that leaves a person's change to a commit and /krites:approve", async () => {
+  const repo = makeRepo({ files: { "a.txt": "a\n", ".claude/settings.json": "{}\n" } });
+  configure(repo, { commands: [pass()], globs: [".claude/settings.json"] });
+  seed(repo);
+  fs.writeFileSync(path.join(repo, ".claude", "settings.json"), '{ "model": "opus" }\n');
+  assert.strictEqual(
+    assertBlock(await runHook(GATE, stop(repo), { cwd: repo }), /protected path changed/),
+    "Krites refuted the stop: protected path changed: .claude/settings.json. Protected paths are human-edited only: if you changed it, undo your change; if a person did, they commit it and review it with /krites:approve.",
+  );
+
+  fs.writeFileSync(path.join(repo, ".claude", "settings.json"), "{}\n");
+  fs.appendFileSync(path.join(repo, "krites.toml"), "\n");
+  assert.strictEqual(
+    assertBlock(await runHook(GATE, stop(repo), { cwd: repo }), /protected path changed/),
+    "Krites refuted the stop: protected path changed: krites.toml. If you changed it yourself, run /krites:init to approve it.",
+  );
 });

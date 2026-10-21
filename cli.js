@@ -2,7 +2,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const gate = require("./hooks/gate.js");
-const { findRoots, loadConfig } = require("./lib/config.js");
+const { findRoots, loadConfig, parseToml, protectedGlobs } = require("./lib/config.js");
 const ping = require("./lib/ping.js");
 const receipts = require("./lib/receipt.js");
 const { scrub } = require("./lib/scrub.js");
@@ -31,7 +31,7 @@ const GLOBS = [
 const MARKERS = "Cargo.toml, package.json, pyproject.toml, pytest.ini or go.mod";
 const NO_CHECKS = "krites.toml configures no checks, so nothing ran.";
 const NO_ROOT = "This repo has no krites.toml, so Krites is checking nothing. Run /krites:init.";
-const USAGE = "usage: /krites:init, /krites:init-write, /krites:verify, /krites:receipt, /krites:telemetry, /krites:telemetry-on, /krites:telemetry-off";
+const USAGE = "usage: /krites:init, /krites:init-write, /krites:approve, /krites:approve-write, /krites:verify, /krites:receipt, /krites:telemetry, /krites:telemetry-on, /krites:telemetry-off";
 
 const lines = [];
 const say = (text, root) => lines.push(scrub(String(text), root));
@@ -163,6 +163,8 @@ function approve(root, write) {
   if (env.length > 0) lines.push("with this environment:", ...env);
   say(lines.join("\n"), root);
   if (!write) return say("Nothing was written. Run /krites:init-write to approve this krites.toml for the gate.", root);
+  // New globs can protect a path no approval showed, so an accepted config ends any approval first.
+  state.dropRange(root, state.APPROVED);
   state.writeConfigHash(root, loaded.hash);
   say("The gate now accepts this krites.toml.", root);
 }
@@ -181,9 +183,116 @@ function init(args) {
   say(text.trimEnd(), root);
   if (!write) return say("Nothing was written. Run /krites:init-write to create it.", root);
   fs.writeFileSync(path.join(root, "krites.toml"), text, { flag: "wx" });
+  state.dropRange(root, state.APPROVED);
   state.writeConfigHash(root, state.hashText(text));
   say("krites.toml is written and the gate accepts it. Run /krites:verify to run the checks now.", root);
 }
+
+const SHOWN = 200;
+const SAFE_DIFF = "git --no-replace-objects --literal-pathspecs diff --no-ext-diff --no-textconv --text";
+const NO_BASELINE = "There is no session baseline here, so there is nothing to approve: the gate compares against HEAD. Nothing was written.";
+const NOTHING = "No commit since the baseline changed a protected path, so there is nothing to approve. Nothing was written.";
+const UNLISTED = "Krites could not list the changed paths here, so nothing was written.";
+const STILL = "The next stop still runs the checks, and only a pass moves the baseline.";
+const AGAIN = "so nothing was approved. Run /krites:approve again.";
+// Format and separator characters too: a bidi override or a line separator can make a diff read as something it is not.
+const visible = (text) =>
+  text.replace(/(?!\t)[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (ch) => {
+    const code = ch.codePointAt(0);
+    return code < 0x100 ? `\\x${code.toString(16).padStart(2, "0")}` : `\\u{${code.toString(16)}}`;
+  });
+// No diff line starts with "* ", so a path the CLI lists cannot be faked by the content it shows.
+const listed = (rels) => rels.map((rel) => `* ${visible(rel)}`);
+// A replace ref would show other objects than the ids name, so the calls that build what is shown read the real ones;
+// the gate's rule, and with it the not-committed list, uses git's defaults.
+const shown = (root, args) => state.git(root, ["--no-replace-objects", "--literal-pathspecs", ...args]);
+const short = (root, id) => (shown(root, ["rev-parse", "--short", id]) || id).trim();
+const outLines = (out) => (out === null ? null : out === "" ? [] : out.replace(/\n$/, "").split("\n"));
+
+// The [protect] globs of the krites.toml a commit holds, read with the same parser; none when it has no readable one.
+function globsAt(root, id) {
+  const text = shown(root, ["cat-file", "blob", `${id}:./krites.toml`]);
+  try {
+    const parsed = text === null ? null : parseToml(text);
+    const globs = parsed && parsed.ok && parsed.value.protect ? parsed.value.protect.globs : null;
+    return Array.isArray(globs) ? globs.filter((glob) => typeof glob === "string" && glob !== "") : [];
+  } catch {
+    return [];
+  }
+}
+
+// Every protected path that differs between the two commits holds all an approval of them can excuse. Protected means
+// under the working krites.toml, the baseline's or HEAD's, so a narrowed krites.toml cannot hide one.
+function review(root, loaded, { baseline, head }) {
+  const names = shown(root, ["diff", "--name-only", "--no-renames", "--relative", "-z", baseline, head]);
+  const now = gate.protectedChanges(root, loaded, head);
+  if (names === null || now === null) return null;
+  const globs = [...protectedGlobs(loaded.config), ...globsAt(root, baseline), ...globsAt(root, head)];
+  const rels = names.split("\0").filter((rel) => rel !== "" && globs.some((glob) => matches(glob, rel))).sort();
+  const log = rels.length === 0 ? [] : outLines(shown(root, ["log", "--format=%h %s", `${baseline}..${head}`, "--", ...rels]));
+  if (log === null) return null;
+  const [from, to] = [short(root, baseline), short(root, head)];
+  return {
+    rels,
+    log: log.length === 0 ? [`(no commit in ${from}..${to} changed these paths)`] : log.map(visible),
+    descends: shown(root, ["merge-base", "--is-ancestor", baseline, head]) !== null,
+    dirty: now.paths.filter((rel) => now.changed.includes(rel)).sort(),
+  };
+}
+
+function show(root, loaded, range) {
+  const seen = review(root, loaded, range);
+  if (seen === null) return say(UNLISTED, root);
+  const notCommitted = seen.dirty.length === 0 ? [] : ["not committed, so not approvable:", ...listed(seen.dirty)];
+  if (seen.rels.length === 0) {
+    state.dropRange(root, state.PENDING);
+    return say([NOTHING, ...notCommitted].join("\n"), root);
+  }
+  const flags = ["--no-ext-diff", "--no-textconv", "--text", "--no-color", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/", "--stat", "--patch"];
+  const diff = outLines(shown(root, ["diff", ...flags, range.baseline, range.head, "--", ...seen.rels]));
+  if (diff === null) return say(UNLISTED, root);
+  const body = [...seen.log, ...diff.map(visible)];
+  const [from, to] = [short(root, range.baseline), short(root, range.head)];
+  const title = seen.descends ? `Protected paths changed in commits since the baseline ${from}:` : `Protected paths that differ between the baseline ${from} and HEAD ${to}:`;
+  const out = [title, ...listed(seen.rels), ...body.slice(0, SHOWN)];
+  // Ids only: a path is text the repo chose, and this line is a command a person may paste.
+  if (body.length > SHOWN) out.push(`(${body.length - SHOWN} more lines not shown: ${SAFE_DIFF} ${from} ${to})`);
+  out.push(...notCommitted, `Nothing is approved yet. Run /krites:approve-write to approve these changes up to ${to}.`);
+  state.writeRange(root, state.PENDING, range);
+  say(out.join("\n"), root);
+}
+
+function approveWrite(root, loaded, { baseline, head }) {
+  if (baseline === null || head === "") return say(NO_BASELINE, root);
+  const pending = state.readRange(root, state.PENDING);
+  if (pending === null) return say("Nothing is waiting for approval. Run /krites:approve first.", root);
+  state.dropRange(root, state.PENDING);
+  if (pending.head !== head) return say(`HEAD moved from ${short(root, pending.head)} to ${short(root, head)} after /krites:approve, ${AGAIN}`, root);
+  if (pending.baseline !== baseline) {
+    return say(`The baseline moved from ${short(root, pending.baseline)} to ${short(root, baseline)} after /krites:approve, ${AGAIN}`, root);
+  }
+  const seen = review(root, loaded, pending);
+  if (seen === null) return say(UNLISTED, root);
+  if (seen.rels.length === 0) return say(NOTHING, root);
+  const blob = shown(root, ["cat-file", "blob", `${head}:./krites.toml`]);
+  const config = seen.rels.includes("krites.toml") && blob !== null && state.hashText(blob) === loaded.hash;
+  state.writeRange(root, state.APPROVED, pending);
+  if (config) state.writeConfigHash(root, loaded.hash);
+  const out = [`Approved these protected changes up to ${short(root, head)}:`, ...listed(seen.rels), ...seen.log];
+  say([...out, ...(config ? ["The gate now accepts this krites.toml."] : []), STILL].join("\n"), root);
+}
+
+// A commit id binds what was shown exactly, so only a commit is ever approved, never the working tree or the index.
+const approveCommits = (write) =>
+  eachRoot((root, loaded) => {
+    const { head, baseline } = gate.treeState(root);
+    if (write) return approveWrite(root, loaded, { baseline, head });
+    if (baseline === null || head === "") {
+      state.dropRange(root, state.PENDING);
+      return say(NO_BASELINE, root);
+    }
+    show(root, loaded, { baseline, head });
+  });
 
 // Root-relative, or the last segment when the root lies on another drive, so no heading carries a path.
 function where(root) {
@@ -280,10 +389,11 @@ async function run(name, args, options) {
   }
   if (name === "init") {
     if (init(args) === false) return say(USAGE, process.cwd());
-  } else if (args.length === 0 && name === "verify") await verify(options);
+  } else if (name === "approve" && (args.length === 0 || (args.length === 1 && args[0] === "--write"))) await approveCommits(args.length === 1);
+  else if (args.length === 0 && name === "verify") await verify(options);
   else if (args.length === 0 && name === "receipt") await receipt();
   else return say(USAGE, process.cwd());
-  // Consent is asked from a command and never from a hook, so the question closes the three that have output.
+  // Consent is asked from a command and never from a hook, so the question closes the ones that have output.
   const asked = ping.question();
   if (asked !== null) say(asked, process.cwd());
 }

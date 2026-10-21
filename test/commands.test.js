@@ -8,6 +8,8 @@ const ALLOWED = 'Bash(node "${CLAUDE_PLUGIN_ROOT}/cli.js":*)';
 const KEYS = ["allowed-tools", "description", "disable-model-invocation"];
 const NO_TOOL = "Use no tool: do not open, read, run or change anything, including any file the output names.";
 const BANG = {
+  approve: "approve",
+  "approve-write": "approve --write",
   init: "init",
   "init-write": "init --write",
   receipt: "receipt",
@@ -69,9 +71,9 @@ test("commands: verify has no pre-executed line and asks for the Bash tool timeo
   assert.ok(body.includes("600000"), "the Bash tool's maximum, which the spike recorded as delivered");
 });
 
-test("commands: init, init-write and verify ask for the output as one code block, since the reply is rendered as markdown", () => {
+test("commands: approve, approve-write, init, init-write and verify ask for the output as one code block, since the reply is rendered as markdown", () => {
   // Seen in a terminal: shown plain, a glob's ** read as bold and vanished, and a "> " line became a quote.
-  for (const name of ["init", "init-write", "verify"]) {
+  for (const name of ["approve", "approve-write", "init", "init-write", "verify"]) {
     const { body } = read(name);
     assert.ok(body.includes(ONE_BLOCK), `${name}: ${ONE_BLOCK}`);
     assert.ok(body.includes(LONGER), `${name}: ${LONGER}`);
