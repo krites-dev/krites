@@ -181,9 +181,21 @@ test("zero-config: in a repo with no commit at startup, a committed krites.toml 
   assertBlock(await runHook(GATE, stop(repo), { cwd: repo }), /protected path changed: krites\.toml/);
 });
 
-test("zero-config: a session start without the program on PATH leaves another session's record and gate alone", async () => {
+// npm can share git's folder, so git gets a folder of its own; Git for Windows' launcher finds its install
+// from where it sits, so there its folder is kept.
+function gitAlone() {
   const where = spawnSync(WINDOWS ? "where" : "which", ["git"], { encoding: "utf8", windowsHide: true });
-  const gitDir = path.dirname(where.stdout.split(/\r?\n/)[0].trim());
+  const git = where.stdout.split(/\r?\n/)[0].trim();
+  assert.ok(git, "git is on PATH");
+  if (WINDOWS) return path.dirname(git);
+  const dir = makeDir();
+  fs.symlinkSync(git, path.join(dir, "git"));
+  return dir;
+}
+
+test("zero-config: a session start without the program on PATH leaves another session's record and gate alone", async (t) => {
+  const gitDir = gitAlone();
+  if (["npm", "npm.cmd", "npm.exe"].some((name) => fs.existsSync(path.join(gitDir, name)))) return t.skip(`npm sits beside git in ${gitDir}`);
   const { repo, ran } = zeroRepo({ exit: 1 });
   await started(repo);
   const before = fs.readFileSync(krites(repo, "zero.json"), "utf8");
