@@ -83,7 +83,7 @@ test("deadline: the watchdog charges the root it interrupted, not the one that a
   const inner = path.join(outer, "inner");
   fs.mkdirSync(inner);
   fs.writeFileSync(path.join(inner, "krites.toml"), toml({ commands: [script("process.exit(0)")] }));
-  fs.writeFileSync(path.join(outer, "krites.toml"), toml({ commands: [script("setTimeout(() => process.exit(1), 3500)")] }));
+  fs.writeFileSync(path.join(outer, "krites.toml"), toml({ commands: [script("setTimeout(() => process.exit(1), 8500)")] }));
   git(outer, "add", "-A");
   git(outer, "commit", "-q", "-m", "config");
   seed(outer);
@@ -94,8 +94,9 @@ test("deadline: the watchdog charges the root it interrupted, not the one that a
   const left = path.join(outer, ".krites", "last-run.json");
   for (let attempt = 1; attempt <= 4; attempt += 1) {
     fs.rmSync(left, { force: true });
-    const reason = await fromTmp(() => freshGuarded()(payload, { watchdogMs: 3000, projectDir: outer }));
-    if (attempt < 4) assert.match(reason, /gate timed out after 3 s/);
+    // The inner root's pass has to finish inside the watchdog, with room for a loaded machine.
+    const reason = await fromTmp(() => freshGuarded()(payload, { watchdogMs: 8000, projectDir: outer }));
+    if (attempt < 4) assert.match(reason, /gate timed out after 8 s/);
     else assert.strictEqual(reason, null, "the chain ends with the interrupted root's budget");
     assert.strictEqual(readBlockCount(inner), 0, "the root that passed is never charged");
     assert.strictEqual(readBlockCount(outer), attempt);

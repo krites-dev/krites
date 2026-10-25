@@ -1,7 +1,7 @@
 const path = require("node:path");
 
 const { runChecks } = require("../lib/checks.js");
-const { DEFAULT_MAX_BLOCKS, findRoots, loadConfig, protectedGlobs } = require("../lib/config.js");
+const { DEFAULT_MAX_BLOCKS, findRoots, loadConfig, protectedGlobs, zeroConfig, zeroEntry } = require("../lib/config.js");
 const { matches } = require("../lib/glob.js");
 const hookio = require("../lib/hookio.js");
 const ping = require("../lib/ping.js");
@@ -13,6 +13,7 @@ const VERSION = require("../.claude-plugin/plugin.json").version;
 const ADVICE = "Fix it and let the checks run before stopping. Do not describe results; the gate reads them.";
 const APPROVE = "If you changed it yourself, run /krites:init to approve it.";
 const HUMAN = "Protected paths are human-edited only: if you changed it, undo your change; if a person did, they commit it and review it with /krites:approve.";
+const GUESS = "Krites guessed this command because the repo has no krites.toml; a person can change it with /krites:init.";
 const EXHAUSTED = "attempt budget exhausted";
 const UNLISTED = "could not list the changed paths, so no check can be trusted";
 const UNWRITABLE = (code) =>
@@ -36,6 +37,21 @@ const isObject = (value) => typeof value === "object" && value !== null && !Arra
 const labelled = (entry, reason) =>
   entry && entry.label ? `In ${entry.label}: ${reason.replace(/\/krites:(?:init|approve)(?:-write)?/g, (command) => `${command} from a session started in ${entry.label}`)}` : reason;
 const budgetMs = (elapsedMs, seconds, totalMs = BUDGET_MS) => Math.max(0, Math.min(seconds * 1000, totalMs - elapsedMs));
+
+const loadFor = (entry) => (entry.error ? { ok: false, error: entry.error } : entry.zero ? zeroConfig(entry.zero.command) : loadConfig(entry.root));
+
+// The krites roots, then the zero-config root when its session recorded one. A root with no session-head of its own
+// takes a recorded zero-config head, or the empty tree for a start with no commit, so a krites.toml committed since is in the diff.
+function gateRoots(where) {
+  const roots = findRoots(where);
+  for (const entry of roots) {
+    const record = state.readZero(entry.root);
+    if (record !== null && state.readBaseline(entry.root) === null) entry.recorded = record.head ?? state.emptyTree(entry.root);
+  }
+  const zero = zeroEntry(where);
+  if (zero !== null && !roots.some((entry) => entry.root === zero.root)) roots.push(zero);
+  return roots;
+}
 
 // Every block spends one attempt from the root's budget; once it is spent the stop is allowed, so no chain of stops blocks without end.
 // One answer per root per hook run: a throw after the spend reaches the fail path, which must not charge the same block again.
@@ -66,10 +82,10 @@ const answer = (reason, held = false) => (reason === null ? null : { reason, hel
 // It is never spread over roots that passed or were not reached: their budgets are theirs.
 function boundedByAll(reason, { cwd, projectDir = process.env.CLAUDE_PROJECT_DIR } = {}) {
   try {
-    const owners = current ? [current] : findRoots({ cwd, projectDir });
+    const owners = current ? [current] : gateRoots({ cwd, projectDir });
     let left = owners.length === 0;
     for (const entry of owners) {
-      const loaded = entry.error ? { ok: false } : loadConfig(entry.root);
+      const loaded = loadFor(entry);
       if (!spend(entry.root, loaded.ok ? loaded.config.checks.max_blocks : DEFAULT_MAX_BLOCKS)) left = true;
     }
     const gaveWay = owners.find((entry) => unwritable.has(entry.root));
@@ -82,7 +98,7 @@ function boundedByAll(reason, { cwd, projectDir = process.env.CLAUDE_PROJECT_DIR
 
 async function gateRoot(entry, payload, budget) {
   counted.set(entry.root, state.readBlockCount(entry.root));
-  const loaded = entry.error ? { ok: false, error: entry.error } : loadConfig(entry.root);
+  const loaded = loadFor(entry);
   // A config the gate cannot read judges nothing, so it is no attempt: it spends nothing and blocks until it is fixed.
   if (!loaded.ok) return answer(scrub(`Krites blocked the stop: ${loaded.error}`, entry.root), true);
   try {
@@ -98,7 +114,7 @@ function treeState(root, recorded = null) {
   const head = (state.git(root, ["rev-parse", "HEAD"]) || "").trim();
   const status = state.git(root, ["status", "--porcelain", "--untracked-files=normal"]);
   const own = state.readBaseline(root);
-  return { head, dirty: status === null || status.trim() !== "", baseline: own ?? recorded, ownBaseline: own !== null };
+  return { head, dirty: status === null || status.trim() !== "", listed: status !== null, baseline: own ?? recorded, ownBaseline: own !== null };
 }
 
 // The changed-path rule, shared with /krites:approve: every changed path a stop refutes on, krites.toml first.
@@ -123,12 +139,14 @@ function protectedChanges(root, loaded, baseline, ownBaseline = true) {
 
 // The whole judgement, shared with /krites:verify: the bypass check, the checks between two fingerprints, and the reason.
 // `failed` is a clause the caller words for its own event; every other field is what the caller records.
-async function judge(root, loaded, { baseline, ownBaseline = true, deadline, commands = loaded.config.checks.commands }) {
+async function judge(root, loaded, { head, baseline, ownBaseline = true, deadline, commands = loaded.config.checks.commands }) {
   const config = loaded.config;
   // The directory and its .gitignore land before the first fingerprint, so the gate's own writes never change it.
   state.ensureDir(root);
   const before = state.fingerprint(root);
-  const found = protectedChanges(root, loaded, baseline, ownBaseline);
+  const content = state.contentHash(root, head);
+  // Zero-config runs its one command and nothing else: with no krites.toml there is no protected path to judge.
+  const found = loaded.zero ? { record: null, paths: [] } : protectedChanges(root, loaded, baseline, ownBaseline);
   if (found === null) return { failed: UNLISTED };
 
   const { record } = found;
@@ -145,7 +163,7 @@ async function judge(root, loaded, { baseline, ownBaseline = true, deadline, com
         : run.verdict === "timed_out"
           ? `Krites blocked the stop: gate timed out after ${Math.round(deadlineMs / 1000)} s while running ${run.failed.command}. ${ADVICE}`
           : `Krites refuted the stop: ${run.failed.command}\n${run.failed.tail}\n${ADVICE}`;
-  return { run, reason, touched, deadlineMs, before, record };
+  return { run, reason, touched, deadlineMs, before, record, content };
 }
 
 // Only a whole, clean pass is carried: a carried failure would contradict the stop's own passed verdict.
@@ -168,6 +186,7 @@ function recordRun(root, loaded, judged, { head, dirty, baseline, reason, sessio
     head,
     dirty,
     fingerprint: judged.before,
+    ...(judged.run.verdict === "passed" && judged.content !== null ? { content: judged.content } : {}),
     config_hash: loaded.hash,
     commands: loaded.config.checks.commands,
     slow: loaded.config.checks.slow,
@@ -180,7 +199,10 @@ function recordRun(root, loaded, judged, { head, dirty, baseline, reason, sessio
   });
 
   if (judged.run.verdict === "passed") {
-    state.writeBaseline(root, head);
+    // A tree git cannot list fingerprints the same whatever it holds, so it is recorded as none.
+    const listed = !loaded.zero || state.git(root, ["status", "--porcelain"]) !== null;
+    if (loaded.zero) state.writeZero(root, { head, command: loaded.config.checks.commands[0], fingerprint: listed ? judged.before : null });
+    else state.writeBaseline(root, head);
     state.dropRange(root, state.APPROVED);
     // A root the session never saw gets its record here, so its next stop is not refuted for a config nobody edited.
     if (judged.record === null && loaded.hash !== undefined) state.writeConfigHash(root, loaded.hash);
@@ -189,10 +211,13 @@ function recordRun(root, loaded, judged, { head, dirty, baseline, reason, sessio
   }
 }
 
-async function runRoot({ root, recorded }, loaded, payload, budget) {
+async function runRoot({ root, recorded, zero }, loaded, payload, budget) {
   const { timeout_seconds: seconds, max_blocks: maxBlocks } = loaded.config.checks;
-  const { head, dirty, baseline, ownBaseline } = treeState(root, recorded);
-  if (!dirty && baseline !== null && baseline === head) {
+  const { head, dirty, listed, baseline, ownBaseline } = treeState(root, recorded);
+  // Zero-config also leaves alone a tree as this session found it, or as it last passed in any session.
+  const own = zero && (zero.session === null || zero.session === payload.session_id);
+  const unchanged = own && listed && zero.fingerprint !== null && state.fingerprint(root) === zero.fingerprint;
+  if ((!dirty && baseline !== null && baseline === head) || unchanged) {
     // A clean tree at the baseline holds nothing the blocks were about, so the attempts go back.
     try {
       if (counted.get(root) !== 0) state.writeBlockCount(root, 0);
@@ -203,7 +228,7 @@ async function runRoot({ root, recorded }, loaded, payload, budget) {
   }
 
   const deadline = () => budgetMs(Date.now() - budget.startedAt, seconds, budget.totalMs);
-  const judged = await judge(root, loaded, { baseline, ownBaseline, deadline });
+  const judged = await judge(root, loaded, { head, baseline, ownBaseline, deadline });
   if (judged.failed) {
     const reason = `Krites blocked the stop: ${judged.failed}. ${ADVICE}`;
     // Git could not say what changed: nothing was judged, so it is no attempt, and it blocks until it is fixed.
@@ -219,7 +244,8 @@ async function runRoot({ root, recorded }, loaded, payload, budget) {
     reason: exhausted ? EXHAUSTED : judged.reason,
     session_id: typeof payload.session_id === "string" && state.SESSION_ID.test(payload.session_id) ? payload.session_id : null,
   });
-  return exhausted ? null : answer(named(root, judged.reason));
+  const reason = zero && judged.reason !== null ? `${judged.reason}\n${GUESS}` : judged.reason;
+  return exhausted ? null : answer(named(root, reason));
 }
 
 const inside = (dir, target) => {
@@ -260,7 +286,7 @@ async function gate(payload, { totalMs = BUDGET_MS, startedAt = STARTED, project
   current = null;
   timedOut = false;
   if (!isObject(payload)) return boundedByAll(`Krites blocked the stop: the hook payload is not an object. ${ADVICE}`, { projectDir });
-  for (const entry of withTouched(findRoots({ cwd: payload.cwd, projectDir }), payload.session_id)) {
+  for (const entry of withTouched(gateRoots({ cwd: payload.cwd, projectDir }), payload.session_id)) {
     current = entry;
     const blocked = await gateRoot(entry, payload, { totalMs, startedAt });
     if (blocked === null) continue;
@@ -296,4 +322,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { BUDGET_MS, WATCHDOG_MS, budgetMs, gate, guarded, judge, protectedChanges, recordRun, treeState };
+module.exports = { BUDGET_MS, WATCHDOG_MS, budgetMs, gate, gateRoots, guarded, judge, loadFor, protectedChanges, recordRun, treeState };

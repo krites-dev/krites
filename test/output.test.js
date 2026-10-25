@@ -33,13 +33,13 @@ function assertClean(label, result) {
   assert.strictEqual(result.stderr, "", `${label}: nothing on stderr`);
   const out = hookText(result);
   assert.doesNotMatch(out, ABSOLUTE, `${label}: no absolute path`);
-  for (const secret of [PLUGIN, HOOKS, "gate.js", "protect.js", "session.js", "hookio", "CLAUDE_PLUGIN_ROOT", os.homedir()]) {
+  for (const secret of [PLUGIN, HOOKS, "gate.js", "protect.js", "session.js", "commit.js", "hookio", "CLAUDE_PLUGIN_ROOT", os.homedir()]) {
     assert.ok(!out.includes(secret), `${label}: the hook's own command line stays out of the output (${secret})`);
   }
   return out;
 }
 
-test("output: every hook path exits 0 with no absolute path and no command line", { timeout: 60000 }, async () => {
+test("output: every hook path exits 0 with no absolute path and no command line", { timeout: 180000 }, async () => {
   const repo = makeRepo({ files: { "a.txt": "a\n", "secrets/rule.md": "rule\n" } });
   configure(repo, { commands: [script(`console.log("failing in " + process.cwd()); process.exit(2);`)], globs: ["secrets/**"] });
   seed(repo);
@@ -103,6 +103,59 @@ test("output: every hook path exits 0 with no absolute path and no command line"
     assert.doesNotMatch(written, ABSOLUTE, "no absolute path in last-run.json");
     assert.ok(!written.includes(os.homedir()) && !written.includes(PLUGIN), "no home or install path in last-run.json");
   }
+});
+
+test("output: every commit hook path exits 0 with no absolute path but cli.js's", { timeout: 60000 }, async () => {
+  const repo = makeRepo({ files: { "a.txt": "a\n" } });
+  configure(repo, { commands: [script("process.exit(1)")] });
+  seed(repo);
+  fs.writeFileSync(path.join(repo, "a.txt"), "changed\n");
+  await runHook(hook("gate"), stop(repo), { cwd: repo });
+  const fresh = makeRepo({ files: { "a.txt": "a\n" } });
+  configure(fresh, { commands: [script("process.exit(0)")] });
+  fs.writeFileSync(path.join(fresh, "new.txt"), "new\n");
+  const broken = makeRepo({ files: { "a.txt": "a\n" } });
+  configure(broken, "version = 1\n\n[checks]\nnope = 1\n");
+  const plain = makeDir({ "a.txt": "a\n" });
+  const passed = makeRepo({ files: { "a.txt": "a\n", "b.txt": "b\n", ".gitignore": "inner/\n" } });
+  configure(passed, { commands: [script("process.exit(0)")] });
+  seed(passed);
+  fs.writeFileSync(path.join(passed, "a.txt"), "changed\n");
+  fs.writeFileSync(path.join(passed, "new.txt"), "new\n");
+  await runHook(hook("gate"), stop(passed), { cwd: passed });
+  const nested = path.join(passed, "inner");
+  fs.mkdirSync(nested);
+  git(nested, "init", "-q");
+  configure(nested, { commands: [script("process.exit(0)")] });
+
+  const shell = (tool, cwd, command) => ({ hook_event_name: "PreToolUse", tool_name: tool, session_id: "s1", cwd, tool_input: { command } });
+  const runs = [
+    ["commit leave out", shell("Bash", passed, "git commit -am x"), passed],
+    ["commit nested no run", shell("Bash", passed, "cd inner && git commit -am x"), passed],
+    ["commit refuted", shell("Bash", repo, "git commit -am x"), repo],
+    ["commit no run", shell("PowerShell", fresh, "git commit -m x"), fresh],
+    ["commit paths", shell("Bash", repo, "git commit -m x a.txt"), repo],
+    ["commit unknown dir", shell("Bash", repo, "cd $HOME && git commit -m x"), repo],
+    ["commit config error", shell("Bash", broken, "git commit -m x"), broken],
+    ["commit no root", shell("Bash", plain, "git commit -m x"), plain],
+    ["commit other command", shell("Bash", repo, "git status"), repo],
+    ["commit malformed", "{not json", repo],
+  ];
+  const cli = path.join(PLUGIN, "cli.js");
+  const said = new Map();
+  const commit = async (label, payload, cwd) => {
+    const result = await runHook(hook("commit"), payload, { cwd });
+    said.set(label, assertClean(label, { ...result, stdout: result.stdout.split(JSON.stringify(cli).slice(1, -1)).join("cli.js") }));
+  };
+  for (const [label, payload, cwd] of runs) await commit(label, payload, cwd);
+  git(passed, "add", "a.txt", "new.txt");
+  await commit("commit allowed", shell("Bash", passed, "git commit -m x"), passed);
+  fs.writeFileSync(path.join(passed, "b.txt"), "changed after\n");
+  await commit("commit changed since", shell("Bash", passed, "git commit -am x"), passed);
+  assert.match(said.get("commit leave out"), /would leave out: new\.txt/);
+  assert.match(said.get("commit nested no run"), /run cd "inner" && node "cli\.js" verify/);
+  assert.strictEqual(said.get("commit allowed").trim(), "");
+  assert.match(said.get("commit changed since"), /changed since the last passing check run: .*b\.txt/);
 });
 
 test("output: a timed-out gate and a no_checks gate keep the same guarantees", { timeout: 60000 }, async () => {

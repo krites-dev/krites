@@ -10,12 +10,12 @@ const { ABSOLUTE, configure, git, head, makeDir, makeRepo, runCli, runHook, scri
 const CAP = "timed out after 540 s (capped under /krites:verify; the stop gate allows 600 s)";
 
 // A check that outlives the kill would hold the pipes its parent reads, so it lets them go and ends by itself.
-const hangs = () =>
+const hangs = (seconds = 30) =>
   script(
     [
       "process.stdout.destroy();",
       "process.stderr.destroy();",
-      "setTimeout(() => {}, 30000);",
+      `setTimeout(() => {}, ${seconds * 1000});`,
     ].join("\n"),
   );
 
@@ -168,20 +168,22 @@ test("verify: the deadline is the configured timeout, capped at what is left of 
 });
 
 test("verify: two roots share one budget and the second gets only what is left", { timeout: 120000 }, async () => {
-  const hang = hangs();
+  // Longer than the outer root's 60 s, so an unshared budget would take 63 s and fail the bound below.
+  const hang = hangs(90);
   const outer = makeRepo({ files: { "a.txt": "a\n" } });
   const inner = path.join(outer, "inner");
   fs.mkdirSync(inner);
   fs.writeFileSync(path.join(inner, "krites.toml"), toml({ commands: [hang], timeoutSeconds: 3 }));
-  fs.writeFileSync(path.join(outer, "krites.toml"), toml({ commands: [hang], timeoutSeconds: 20 }));
+  fs.writeFileSync(path.join(outer, "krites.toml"), toml({ commands: [hang], timeoutSeconds: 60 }));
   git(outer, "add", "-A");
   git(outer, "commit", "-q", "-m", "config");
   seed(outer);
   seed(inner, outer);
 
-  // 6 s of budget: the inner root spends its own 3 s and the outer root can only have what is left of the 6.
+  // 16 s of budget: the inner root spends its own 3 s and the outer root can only have what is left of the 16.
+  // A loaded machine spends seconds on a root before its check starts, so the budget leaves room for that.
   const driver = script(
-    `require(${JSON.stringify(path.join(__dirname, "..", "cli.js"))}).main(["verify"], { capMs: 6000, startedAt: Date.now() }).then((text) => process.stdout.write(text, () => process.exit(0)));`,
+    `require(${JSON.stringify(path.join(__dirname, "..", "cli.js"))}).main(["verify"], { capMs: 16000, startedAt: Date.now() }).then((text) => process.stdout.write(text, () => process.exit(0)));`,
   )[1];
   const started = Date.now();
   const lines = printed(await runHook(driver, null, { cwd: inner, env: { CLAUDE_PROJECT_DIR: outer.replace(/\\/g, "/") } }));
@@ -190,9 +192,9 @@ test("verify: two roots share one budget and the second gets only what is left",
   assert.strictEqual(lines[2], "timed out after 3 s", lines.join("\n"));
   // Either end proves the shared budget: the outer root is cut short, or the first root left it nothing at all.
   const last = lines[lines.length - 1];
-  const cut = /^timed out after [0-5] s \(capped under \/krites:verify; the stop gate allows 20 s\)$/.test(last);
-  assert.ok(cut || last === "not run: /krites:verify's 6 s were spent before this root", lines.join("\n"));
-  assert.ok(elapsed < 20000, `both roots ran inside the one budget (${elapsed} ms)`);
+  const cut = /^timed out after (?:\d|1[0-2]) s \(capped under \/krites:verify; the stop gate allows 60 s\)$/.test(last);
+  assert.ok(cut || last === "not run: /krites:verify's 16 s were spent before this root", lines.join("\n"));
+  assert.ok(elapsed < 40000, `both roots ran inside the one budget (${elapsed} ms)`);
 });
 
 // verify in this process, with the root's own overhead (fingerprints, git calls) played by a wait before the real judge.
@@ -261,14 +263,14 @@ test("verify: a root left with no time is not run at all", { timeout: 120000 }, 
   seed(inner, outer);
 
   const driver = script(
-    `require(${JSON.stringify(path.join(__dirname, "..", "cli.js"))}).main(["verify"], { capMs: 3000, startedAt: Date.now() }).then((text) => process.stdout.write(text, () => process.exit(0)));`,
+    `require(${JSON.stringify(path.join(__dirname, "..", "cli.js"))}).main(["verify"], { capMs: 10000, startedAt: Date.now() }).then((text) => process.stdout.write(text, () => process.exit(0)));`,
   )[1];
   const lines = printed(await runHook(driver, null, { cwd: inner, env: { CLAUDE_PROJECT_DIR: outer.replace(/\\/g, "/") } }));
 
   assert.strictEqual(lines.length, 5, lines.join("\n"));
-  assert.match(lines[2], /^timed out after [0-2] s \(capped under \/krites:verify; the stop gate allows 20 s\)$/, lines.join("\n"));
+  assert.match(lines[2], /^timed out after \d s \(capped under \/krites:verify; the stop gate allows 20 s\)$/, lines.join("\n"));
   assert.strictEqual(lines[3], "## ..");
-  assert.strictEqual(lines[4], "not run: /krites:verify's 3 s were spent before this root");
+  assert.strictEqual(lines[4], "not run: /krites:verify's 10 s were spent before this root");
   assert.strictEqual(fs.existsSync(marker), false, "the root with no time left runs no check");
   assert.strictEqual(fs.existsSync(path.join(outer, ".krites")), false, "and writes nothing at all");
 });

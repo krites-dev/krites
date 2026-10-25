@@ -2,7 +2,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const gate = require("./hooks/gate.js");
-const { findRoots, loadConfig, parseToml, protectedGlobs } = require("./lib/config.js");
+const { detect, loadConfig, parseToml, protectedGlobs } = require("./lib/config.js");
 const ping = require("./lib/ping.js");
 const receipts = require("./lib/receipt.js");
 const { scrub } = require("./lib/scrub.js");
@@ -44,28 +44,6 @@ const timeoutLine = (seconds, ms = deadlineMs(seconds)) =>
     : `timed out after ${seconds} s`;
 const SPENT = new Error("the /krites:verify budget is spent");
 const spentLine = (capMs) => `not run: /krites:verify's ${Math.round(capMs / 1000)} s were spent before this root`;
-
-function detect(dir) {
-  const has = (rel) => fs.existsSync(path.join(dir, rel));
-  if (has("Cargo.toml")) {
-    return ["cargo fmt --check", "cargo clippy --all-targets -- -D warnings", has(path.join(".config", "nextest.toml")) ? "cargo nextest run" : "cargo test"];
-  }
-  if (has("package.json")) {
-    const pm = has("pnpm-lock.yaml") ? "pnpm" : has("yarn.lock") ? "yarn" : "npm";
-    let scripts = {};
-    try {
-      scripts = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8")).scripts || {};
-    } catch {
-      scripts = {};
-    }
-    const named = ["typecheck", "lint", "test"].filter((name) => typeof scripts[name] === "string");
-    if (named.length > 0) return named.map((name) => (name === "test" ? `${pm} test` : `${pm} run ${name}`));
-    return has("tsconfig.json") ? ["npx tsc --noEmit"] : [];
-  }
-  if (has("pyproject.toml") || has("pytest.ini")) return ["ruff check", "pytest"];
-  if (has("go.mod")) return ["go vet ./...", "go test ./..."];
-  return null;
-}
 
 const isFile = (file) => {
   try {
@@ -191,6 +169,8 @@ function init(args) {
 const SHOWN = 200;
 const SAFE_DIFF = "git --no-replace-objects --literal-pathspecs diff --no-ext-diff --no-textconv --text";
 const NO_BASELINE = "There is no session baseline here, so there is nothing to approve: the gate compares against HEAD. Nothing was written.";
+const NO_CONFIG = (command) =>
+  `This repo has no krites.toml, so there is nothing to approve: the stop gate runs "${command}" and judges no protected path. Nothing was written.`;
 const NOTHING = "No commit since the baseline changed a protected path, so there is nothing to approve. Nothing was written.";
 const UNLISTED = "Krites could not list the changed paths here, so nothing was written.";
 const STILL = "The next stop still runs the checks, and only a pass moves the baseline.";
@@ -229,13 +209,15 @@ function review(root, loaded, { baseline, head }) {
   if (names === null || now === null) return null;
   const globs = [...protectedGlobs(loaded.config), ...globsAt(root, baseline), ...globsAt(root, head)];
   const rels = names.split("\0").filter((rel) => rel !== "" && globs.some((glob) => matches(glob, rel))).sort();
-  const log = rels.length === 0 ? [] : outLines(shown(root, ["log", "--format=%h %s", `${baseline}..${head}`, "--", ...rels]));
+  // A session that started before the first commit has the empty tree as its baseline: every commit is since then.
+  const commit = shown(root, ["rev-parse", "--verify", "--quiet", `${baseline}^{commit}`]) !== null;
+  const log = rels.length === 0 ? [] : outLines(shown(root, ["log", "--format=%h %s", commit ? `${baseline}..${head}` : head, "--", ...rels]));
   if (log === null) return null;
   const [from, to] = [short(root, baseline), short(root, head)];
   return {
     rels,
     log: log.length === 0 ? [`(no commit in ${from}..${to} changed these paths)`] : log.map(visible),
-    descends: shown(root, ["merge-base", "--is-ancestor", baseline, head]) !== null,
+    descends: !commit || shown(root, ["merge-base", "--is-ancestor", baseline, head]) !== null,
     dirty: now.paths.filter((rel) => now.changed.includes(rel)).sort(),
   };
 }
@@ -284,8 +266,9 @@ function approveWrite(root, loaded, { baseline, head }) {
 
 // A commit id binds what was shown exactly, so only a commit is ever approved, never the working tree or the index.
 const approveCommits = (write) =>
-  eachRoot((root, loaded) => {
-    const { head, baseline } = gate.treeState(root);
+  eachRoot((root, loaded, { recorded }) => {
+    if (loaded.zero) return say(NO_CONFIG(loaded.config.checks.commands[0].join(" ")), root);
+    const { head, baseline } = gate.treeState(root, recorded);
     if (write) return approveWrite(root, loaded, { baseline, head });
     if (baseline === null || head === "") {
       state.dropRange(root, state.PENDING);
@@ -301,13 +284,14 @@ function where(root) {
   return path.isAbsolute(rel) ? path.basename(root) : rel;
 }
 
+// The cwd and project roots a stop judges, each with the fallback baseline the gate gives it.
 async function eachRoot(perRoot) {
-  const roots = findRoots({ cwd: process.cwd(), projectDir: process.env.CLAUDE_PROJECT_DIR });
+  const roots = gate.gateRoots({ cwd: process.cwd(), projectDir: process.env.CLAUDE_PROJECT_DIR });
   if (roots.length === 0) return say(NO_ROOT, process.cwd());
   for (const entry of roots) {
     if (roots.length > 1) say(`## ${where(entry.root)}`, entry.root);
-    const loaded = entry.error ? { ok: false, error: entry.error } : loadConfig(entry.root);
-    if (loaded.ok) await perRoot(entry.root, loaded);
+    const loaded = gate.loadFor(entry);
+    if (loaded.ok) await perRoot(entry.root, loaded, entry);
     else say(loaded.error, entry.root);
   }
 }
@@ -319,19 +303,19 @@ const endLine = (check, judged, seconds, last) => {
 };
 
 const verify = ({ capMs, startedAt }) =>
-  eachRoot(async (root, loaded) => {
-    await checkRoot(root, loaded, { capMs, startedAt });
+  eachRoot(async (root, loaded, { recorded }) => {
+    await checkRoot(root, loaded, { capMs, startedAt, recorded });
     const { off, unreadable } = settings.survey(root);
     for (const file of unreadable) say(settings.unknown(file), root);
     if (off !== null) say(settings.describe(off), root);
   });
 
-async function checkRoot(root, loaded, { capMs, startedAt }) {
+async function checkRoot(root, loaded, { capMs, startedAt, recorded }) {
   const seconds = loaded.config.checks.timeout_seconds;
   // Taken before any work, so a root with no budget left is left as it was instead of being killed mid-check.
   const ms = deadlineMs(seconds, Date.now() - startedAt, capMs);
   if (ms === 0) return say(spentLine(capMs), root);
-  const { head, dirty, baseline } = gate.treeState(root);
+  const { head, dirty, baseline, ownBaseline } = gate.treeState(root, recorded);
   // Read again when the checks start, so this root's own fingerprints and git calls come out of its deadline;
   // when they have spent it all, no check is started just to be killed and recorded over the last good run.
   const deadline = () => {
@@ -342,7 +326,7 @@ async function checkRoot(root, loaded, { capMs, startedAt }) {
   let judged;
   try {
     const commands = [...loaded.config.checks.commands, ...loaded.config.checks.slow];
-    judged = await gate.judge(root, loaded, { baseline, deadline, commands });
+    judged = await gate.judge(root, loaded, { head, baseline, ownBaseline, deadline, commands });
   } catch (err) {
     if (err === SPENT) return say(spentLine(capMs), root);
     throw err;

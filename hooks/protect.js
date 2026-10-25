@@ -2,7 +2,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const { enclosingRoots, findRoots, loadConfig, loadUserConfig, protectedGlobs } = require("../lib/config.js");
+const { enclosingRoots, findRoots, loadConfig, loadUserConfig, protectedGlobs, zeroConfig, zeroEntry } = require("../lib/config.js");
 const { matches } = require("../lib/glob.js");
 const hookio = require("../lib/hookio.js");
 const { configDir } = require("../lib/sign.js");
@@ -78,6 +78,12 @@ function outsideReason(target, name, outside) {
   const expand = (entry) => (/^~[\\/]/.test(entry) ? path.join(home, entry.slice(2)) : entry);
   const fold = WINDOWS || process.platform === "darwin";
   if (!loaded.allowOutside.some((entry) => matches(expand(entry), clean, { fold }))) return outside;
+  if (ownConfig(clean)) return `Blocked: ${name} is in Claude Code's or Krites's own configuration, which allow_outside never opens.`;
+  return null;
+}
+
+// The folders that hold the signing key, the user config and Claude Code's settings, and Claude Code's global files.
+function ownConfig(clean) {
   // Folded on every OS: a home on a case-insensitive volume under Linux still reaches ~/.claude as ~/.CLAUDE.
   const key = (file) => file.normalize("NFC").toLowerCase();
   const claudeDir = process.env.CLAUDE_CONFIG_DIR;
@@ -95,10 +101,7 @@ function outsideReason(target, name, outside) {
   const homes = withReal(os.homedir()).map(tidy).map(key);
   const globalFile = (file) => homes.includes(key(path.dirname(file))) && /^\.claude[^\\/]*\.json$/i.test(path.basename(file));
   const linkedJson = resolved(path.join(os.homedir(), ".claude.json"));
-  if (own.some((dir) => within(key(dir), key(clean))) || globalFile(clean) || key(tidy(linkedJson)) === key(clean)) {
-    return `Blocked: ${name} is in Claude Code's or Krites's own configuration, which allow_outside never opens.`;
-  }
-  return null;
+  return own.some((dir) => within(key(dir), key(clean))) || globalFile(clean) || key(tidy(linkedJson)) === key(clean);
 }
 
 function reasonFor(file, roots, configs, memoryOf, touched) {
@@ -171,9 +174,45 @@ function remember(sessionId, touched, roots) {
   }
 }
 
-function decide(payload, roots) {
+// A repo gated without a krites.toml keeps its built-in paths and hook settings from the edit tools, and outside it
+// Claude Code's and Krites's own configuration; every other path stays open.
+function zeroReason(payload, zero) {
+  const input = payload.tool_input;
+  if (input === null || typeof input !== "object" || Array.isArray(input)) return null;
+  const globs = protectedGlobs(zeroConfig(zero.zero.command).config);
+  const base = typeof payload.cwd === "string" && path.isAbsolute(payload.cwd) ? payload.cwd : zero.root;
+  for (const key of PATH_KEYS) {
+    const raw = input[key];
+    if (typeof raw !== "string" || raw === "" || raw.includes("\0")) continue;
+    const name = raw.split(/[\\/]/).filter(Boolean).pop() || "the path";
+    // A device path to a drive letter names that drive's own file. Any other device path, and a share, can lead back
+    // into the repo by a route the resolved path does not show, so neither is open, and a share is never touched.
+    const file = WINDOWS ? raw.replace(/^[\\/]{2}[?.][\\/](?=[A-Za-z]:[\\/])/, "") : raw;
+    const unreadable = `Blocked: ${name} is a network or device path, so Krites cannot tell what it reaches.`;
+    if ((UNC.test(file) || /^[\\/]{2}[?.][\\/]/.test(file)) && !UNC.test(zero.root)) return unreadable;
+    const target = realTarget(path.resolve(base, file));
+    if (UNC.test(target) && !UNC.test(zero.root)) return unreadable;
+    const { root } = path.parse(target);
+    const rest = target.slice(root.length);
+    if (WINDOWS && rest.includes(":")) return `Blocked: ${name} names an alternate data stream.`;
+    const clean = path.join(root, ...rest.split(/[\\/]+/).filter(Boolean).map((part) => (WINDOWS ? part.replace(/[. ]+$/, "") : part)));
+    const rel = path.relative(zero.root, clean).replace(/\\/g, "/");
+    if (rel === "" || rel === ".." || rel.startsWith("../") || path.isAbsolute(rel)) {
+      const memory = memoryDirOf(payload);
+      if (memory && inside(memory, target) && !(WINDOWS && path.relative(memory, target).includes(":"))) continue;
+      if (ownConfig(clean)) return `Blocked: ${name} is in Claude Code's or Krites's own configuration.`;
+      continue;
+    }
+    const folded = rel.split("/").map((part) => part.replace(/[. ]+$/, ""));
+    if (folded.includes("")) return `Blocked: ${name} has a path component made only of dots or spaces.`;
+    if (globs.some((glob) => matches(glob, folded.join("/")))) return `Blocked: ${folded.join("/")} is protected. Protected paths are human-edited only.`;
+  }
+  return null;
+}
+
+function decide(payload, roots, zero = null) {
   if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return "Blocked: the hook payload is not an object.";
-  if (!roots || roots.length === 0) return null;
+  if (!roots || roots.length === 0) return zero ? zeroReason(payload, zero) : null;
   const configs = new Map();
   for (const entry of roots) {
     const loaded = entry.error ? { ok: false, error: entry.error } : loadConfig(entry.root);
@@ -205,9 +244,13 @@ const deny = (reason) =>
 
 if (require.main === module) {
   hookio.run({
-    handle: (payload) => deny(decide(payload, findRoots({ cwd: payload && payload.cwd, projectDir: process.env.CLAUDE_PROJECT_DIR }))),
+    handle: (payload) => {
+      const where = { cwd: payload && payload.cwd, projectDir: process.env.CLAUDE_PROJECT_DIR };
+      const roots = findRoots(where);
+      return deny(decide(payload, roots, roots.length === 0 ? zeroEntry(where) : null));
+    },
     fail: (what) => deny(`Blocked: the protect hook ${what}.`),
   });
 }
 
-module.exports = { decide };
+module.exports = { decide, deny };

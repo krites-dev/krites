@@ -5,7 +5,8 @@ const os = require("node:os");
 const path = require("node:path");
 const { test } = require("node:test");
 
-const { readBaseline, readBlockCount, readConfigHash, trimTouched, writeBlockCount } = require("../lib/state.js");
+const { loadConfig } = require("../lib/config.js");
+const { contentHash, readBaseline, readBlockCount, readConfigHash, trimTouched, writeBlockCount } = require("../lib/state.js");
 const { ABSOLUTE, assertBlock, configure, FAKE, fromTmp, git, head, makeDir, makeRepo, runCli, runHook, script, seed, textOf, tmp, toml } = require("./helpers.js");
 
 const GATE = path.join(__dirname, "..", "hooks", "gate.js");
@@ -1166,4 +1167,47 @@ test("gate: a changed protected path is refuted with a reason that leaves a pers
     assertBlock(await runHook(GATE, stop(repo), { cwd: repo }), /protected path changed/),
     "Krites refuted the stop: protected path changed: krites.toml. If you changed it yourself, run /krites:init to approve it.",
   );
+});
+
+test("gate: a passing stop records the content it checked, and a refuted one records none", async () => {
+  const repo = repoWith({ commands: [pass()] });
+  assert.deepStrictEqual(await runHook(GATE, stop(repo), { cwd: repo }), SILENT);
+  const run = lastRun(repo);
+  assert.match(run.content, /^[0-9a-f]{64}$/);
+  assert.strictEqual(run.content, contentHash(repo, run.head));
+
+  const red = repoWith({ commands: [fail()] });
+  assertBlock(await runHook(GATE, stop(red), { cwd: red }), /refuted/);
+  assert.ok(!("content" in lastRun(red)), "a refuted run carries no content");
+
+  const none = repoWith({ commands: [] });
+  assert.deepStrictEqual(await runHook(GATE, stop(none), { cwd: none }), SILENT);
+  assert.strictEqual(lastRun(none).verdict, "no_checks");
+  assert.ok(!("content" in lastRun(none)), "a no_checks run carries no content");
+});
+
+test("gate: a passing stop on an unborn HEAD records its content", async () => {
+  const fresh = makeRepo({ files: { "krites.toml": toml({ commands: [pass()] }), "a.txt": "a\n" }, commit: false });
+  seed(fresh);
+  assert.deepStrictEqual(await runHook(GATE, stop(fresh), { cwd: fresh }), SILENT);
+  const run = lastRun(fresh);
+  assert.strictEqual(run.head, "");
+  assert.strictEqual(run.content, contentHash(fresh, ""));
+});
+
+test("gate: a passing run whose content hash failed records no content", () => {
+  const repo = repoWith({ commands: [pass()] });
+  const { recordRun } = require(GATE);
+  const judged = { run: { verdict: "passed", checks: [] }, before: "f", record: null, content: null };
+  recordRun(repo, loadConfig(repo), judged, { head: head(repo), dirty: true, baseline: null, reason: null, session_id: null });
+  assert.strictEqual(lastRun(repo).verdict, "passed");
+  assert.ok(!("content" in lastRun(repo)));
+});
+
+test("gate: a passing /krites:verify records its content too", async () => {
+  const repo = repoWith({ commands: [pass()] });
+  await runCli(["verify"], { cwd: repo });
+  const run = lastRun(repo);
+  assert.strictEqual(run.verdict, "passed");
+  assert.strictEqual(run.content, contentHash(repo, run.head));
 });

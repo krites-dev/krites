@@ -8,6 +8,7 @@ const { loadConfig } = require("../lib/config.js");
 const {
   changedPaths,
   configHash,
+  contentHash,
   diffStat,
   fingerprint,
   readBaseline,
@@ -235,4 +236,79 @@ test("state: the config hash is the sha256 of krites.toml on disk", () => {
   assert.strictEqual(readConfigHash(repo), expected);
   fs.rmSync(path.join(repo, "krites.toml"));
   assert.strictEqual(configHash(repo), null);
+});
+
+test("state: the content hash ignores staging and follows every changed path's bytes, untracked ones too", () => {
+  const repo = makeRepo({ files: { "a.txt": "a\n", "b.txt": "b\n" } });
+  const base = git(repo, "rev-parse", "HEAD").stdout.toString().trim();
+  fs.writeFileSync(path.join(repo, "a.txt"), "changed\n");
+  const checked = contentHash(repo, base);
+  assert.match(checked, /^[0-9a-f]{64}$/);
+
+  git(repo, "add", "a.txt");
+  assert.strictEqual(contentHash(repo, base), checked, "git add of the checked change leaves it equal");
+
+  fs.writeFileSync(path.join(repo, "a.txt"), "changed again\n");
+  assert.notStrictEqual(contentHash(repo, base), checked, "an edit to a path already in the change is seen");
+
+  fs.writeFileSync(path.join(repo, "a.txt"), "changed\n");
+  assert.strictEqual(contentHash(repo, base), checked);
+  fs.writeFileSync(path.join(repo, "new.txt"), "new\n");
+  assert.notStrictEqual(contentHash(repo, base), checked, "an untracked file is seen");
+});
+
+test("state: the content hash rewrites no index on a stat-only change, and a staged deletion keeps it", () => {
+  const repo = makeRepo({ files: { "a.txt": "a\n", "b.txt": "b\n", "c.txt": "c\n" } });
+  const base = git(repo, "rev-parse", "HEAD").stdout.toString().trim();
+  fs.writeFileSync(path.join(repo, "a.txt"), "changed\n");
+  fs.rmSync(path.join(repo, "b.txt"));
+  const checked = contentHash(repo, base);
+  const later = new Date(Date.now() + 10000);
+  fs.utimesSync(path.join(repo, "c.txt"), later, later);
+  const index = fs.readFileSync(path.join(repo, ".git", "index"));
+  assert.strictEqual(contentHash(repo, base), checked, "a stat-only change is no change");
+  assert.deepStrictEqual(fs.readFileSync(path.join(repo, ".git", "index")), index, "the index is left as it was");
+  git(repo, "add", "-A");
+  assert.strictEqual(contentHash(repo, base), checked, "staging the edit and the deletion changes nothing");
+});
+
+test("state: a nested root's content hash covers only its own prefix", () => {
+  const { repo, root } = sub({ "a.txt": "a\n" });
+  const base = git(repo, "rev-parse", "HEAD").stdout.toString().trim();
+  fs.writeFileSync(path.join(root, "a.txt"), "changed\n");
+  const checked = contentHash(root, base);
+
+  fs.writeFileSync(path.join(repo, "root.txt"), "outside\n");
+  fs.writeFileSync(path.join(repo, "loose.txt"), "outside\n");
+  assert.strictEqual(contentHash(root, base), checked, "changes above the root are not its content");
+
+  fs.writeFileSync(path.join(root, "b.txt"), "inside\n");
+  assert.notStrictEqual(contentHash(root, base), checked);
+});
+
+test("state: an unborn HEAD has a content hash, and a directory git cannot read has none", () => {
+  const fresh = makeRepo({ files: { "a.txt": "a\n" }, commit: false });
+  const before = contentHash(fresh, "");
+  assert.match(before, /^[0-9a-f]{64}$/);
+  fs.writeFileSync(path.join(fresh, "a.txt"), "changed\n");
+  assert.notStrictEqual(contentHash(fresh, ""), before);
+
+  assert.strictEqual(contentHash(makeDir({ "a.txt": "a\n" }), ""), null);
+});
+
+test("state: a new file keeps its content hash when it is staged and changes it when its bytes do", () => {
+  const repo = makeRepo({ files: { "a.txt": "a\n" } });
+  const base = git(repo, "rev-parse", "HEAD").stdout.toString().trim();
+  fs.writeFileSync(path.join(repo, "new.txt"), "new\n");
+  const untracked = contentHash(repo, base);
+
+  fs.writeFileSync(path.join(repo, "new.txt"), "new, never staged\n");
+  assert.notStrictEqual(contentHash(repo, base), untracked, "an untracked file's bytes are hashed, not only its name");
+
+  fs.writeFileSync(path.join(repo, "new.txt"), "new\n");
+  git(repo, "add", "new.txt");
+  assert.strictEqual(contentHash(repo, base), untracked, "staging a new file leaves it equal");
+
+  fs.writeFileSync(path.join(repo, "new.txt"), "new, edited after git add\n");
+  assert.notStrictEqual(contentHash(repo, base), untracked);
 });

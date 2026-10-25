@@ -1,5 +1,5 @@
 ---
-description: Run this repo's configured checks now and show their raw output.
+description: Run the checks the stop gate runs in this repo now and show their raw output.
 allowed-tools: Bash(node "${CLAUDE_PLUGIN_ROOT}/cli.js":*)
 disable-model-invocation: true
 ---

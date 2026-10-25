@@ -31,6 +31,12 @@ test("timeouts: the fast hooks get 10 s, above the deadline their input reader u
   assert.ok(STDIN_DEADLINE_MS / 1000 <= 5, "the stdin deadline answers well inside the 10 s hook timeout");
 });
 
+test("timeouts: the commit hook sits on Bash and PowerShell with 30 s, beside the edit tools' entry", () => {
+  assert.strictEqual(hooks.PreToolUse.length, 2);
+  const [entry] = hooks.PreToolUse.filter((found) => found.matcher === "Bash|PowerShell");
+  assert.deepStrictEqual(entry.hooks, [{ type: "command", command: "node", args: ["${CLAUDE_PLUGIN_ROOT}/hooks/commit.js"], timeout: 30 }]);
+});
+
 test("timeouts: the Stop entry runs gate.js and SessionStart matches startup and /clear, never resume or compact", () => {
   assert.deepStrictEqual(hooks.Stop[0].hooks[0].args, ["${CLAUDE_PLUGIN_ROOT}/hooks/gate.js"]);
   assert.deepStrictEqual(hooks.SessionStart[0].hooks[0].args, ["${CLAUDE_PLUGIN_ROOT}/hooks/session.js"]);

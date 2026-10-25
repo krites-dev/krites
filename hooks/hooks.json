@@ -24,6 +24,17 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/commit.js"],
+            "timeout": 30
+          }
+        ]
       }
     ],
     "Stop": [
