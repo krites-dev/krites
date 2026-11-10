@@ -5,6 +5,7 @@ const { DEFAULT_MAX_BLOCKS, findRoots, loadConfig, protectedGlobs, zeroConfig, z
 const { matches } = require("../lib/glob.js");
 const hookio = require("../lib/hookio.js");
 const ping = require("../lib/ping.js");
+const power = require("../lib/power.js");
 const { wellFormed } = require("../lib/receipt.js");
 const { scrub } = require("../lib/scrub.js");
 const state = require("../lib/state.js");
@@ -14,6 +15,10 @@ const ADVICE = "Fix it and let the checks run before stopping. Do not describe r
 const APPROVE = "If you changed it yourself, run /krites:init to approve it.";
 const HUMAN = "Protected paths are human-edited only: if you changed it, undo your change; if a person did, they commit it and review it with /krites:approve.";
 const GUESS = "Krites guessed this command because the repo has no krites.toml; a person can change it with /krites:init.";
+const ONCE =
+  "If the checks only ran out of time, stop again without changing anything: on an unchanged tree Krites lets the stop through and tells the user the checks timed out.";
+const UNCHECKED =
+  "Krites let this stop through unchecked: its checks timed out at the last stop and nothing has changed since, so they were not run again. That work has not passed its checks. Run /krites:verify.";
 const EXHAUSTED = "attempt budget exhausted";
 const UNLISTED = "could not list the changed paths, so no check can be trusted";
 const UNWRITABLE = (code) =>
@@ -29,6 +34,8 @@ const charged = new Map();
 const unwritable = new Map();
 // What this run holds so far. The watchdog and the fail path read it too: they must never allow a stop it would block.
 const heldReasons = [];
+// What an allowed stop still owes the user: a root let through on a timeout it did not run again.
+const notes = [];
 let current = null;
 let timedOut = false;
 
@@ -166,15 +173,16 @@ async function judge(root, loaded, { head, baseline, ownBaseline = true, deadlin
   return { run, reason, touched, deadlineMs, before, record, content };
 }
 
-// Only a whole, clean pass is carried: a carried failure would contradict the stop's own passed verdict.
-function carriedSlow(root, loaded, judged) {
+// The last recorded run, when it judged this very tree under this very config: a whole clean pass, or a timeout.
+// Ignored files are outside the fingerprint, so a change only there is not seen.
+function sameTreeRun(root, loaded) {
+  const last = state.readLastRun(root);
+  if (!isObject(last) || last.config_hash !== loaded.hash || !Array.isArray(last.checks) || !last.checks.every(wellFormed)) return null;
   const { commands, slow } = loaded.config.checks;
-  if (judged.run.verdict !== "passed" || judged.run.checks.length !== commands.length || slow.length === 0) return [];
-  const previous = state.readLastRun(root);
-  if (!previous || previous.verdict !== "passed" || previous.fingerprint !== judged.before || previous.config_hash !== loaded.hash) return [];
-  const checks = previous.checks;
-  if (!Array.isArray(checks) || checks.length !== commands.length + slow.length) return [];
-  return checks.every((check) => wellFormed(check) && check.exit_code === 0) ? checks.slice(commands.length) : [];
+  const whole = [commands.length, commands.length + slow.length].includes(last.checks.length) && last.checks.length > 0;
+  const passed = last.verdict === "passed" && whole && last.checks.every((check) => check.exit_code === 0);
+  if (!passed && last.verdict !== "timed_out") return null;
+  return last.fingerprint === state.fingerprint(root) ? last : null;
 }
 
 function recordRun(root, loaded, judged, { head, dirty, baseline, reason, session_id: sessionId }) {
@@ -192,7 +200,7 @@ function recordRun(root, loaded, judged, { head, dirty, baseline, reason, sessio
     slow: loaded.config.checks.slow,
     env: Object.entries(loaded.config.checks.env).map(([name, value]) => `${name}=${value}`),
     diff: state.diffStat(root, baseline),
-    checks: [...judged.run.checks, ...carriedSlow(root, loaded, judged)],
+    checks: judged.run.checks,
     verdict: judged.run.verdict,
     reason,
     session_id: sessionId,
@@ -211,13 +219,17 @@ function recordRun(root, loaded, judged, { head, dirty, baseline, reason, sessio
   }
 }
 
-async function runRoot({ root, recorded, zero }, loaded, payload, budget) {
+async function runRoot({ root, recorded, zero, label }, loaded, payload, budget) {
   const { timeout_seconds: seconds, max_blocks: maxBlocks } = loaded.config.checks;
   const { head, dirty, listed, baseline, ownBaseline } = treeState(root, recorded);
+  const sessionId = typeof payload.session_id === "string" && state.SESSION_ID.test(payload.session_id) ? payload.session_id : null;
   // Zero-config also leaves alone a tree as this session found it, or as it last passed in any session.
   const own = zero && (zero.session === null || zero.session === payload.session_id);
   const unchanged = own && listed && zero.fingerprint !== null && state.fingerprint(root) === zero.fingerprint;
-  if ((!dirty && baseline !== null && baseline === head) || unchanged) {
+  const settled = (!dirty && baseline !== null && baseline === head) || unchanged;
+  const last = settled || !listed ? null : sameTreeRun(root, loaded);
+  // The checks already passed on this very tree, in a stop or under /krites:verify, so the pass is carried.
+  if (settled || (last !== null && last.verdict === "passed")) {
     // A clean tree at the baseline holds nothing the blocks were about, so the attempts go back.
     try {
       if (counted.get(root) !== 0) state.writeBlockCount(root, 0);
@@ -228,6 +240,14 @@ async function runRoot({ root, recorded, zero }, loaded, payload, budget) {
   }
 
   const deadline = () => budgetMs(Date.now() - budget.startedAt, seconds, budget.totalMs);
+  // A timeout blocked this session once and nothing changed since. With no more time to give than that run had, a
+  // second run only times out again, so the stop goes through and the user is told. The timed-out record stays.
+  const spent = last === null ? 0 : last.checks.reduce((sum, check) => sum + check.duration_ms, 0);
+  if (last !== null && sessionId !== null && last.session_id === sessionId && spent >= 0.9 * deadline()) {
+    notes.push(labelled({ label }, UNCHECKED));
+    return null;
+  }
+
   const judged = await judge(root, loaded, { head, baseline, ownBaseline, deadline });
   if (judged.failed) {
     const reason = `Krites blocked the stop: ${judged.failed}. ${ADVICE}`;
@@ -242,10 +262,12 @@ async function runRoot({ root, recorded, zero }, loaded, payload, budget) {
     dirty,
     baseline,
     reason: exhausted ? EXHAUSTED : judged.reason,
-    session_id: typeof payload.session_id === "string" && state.SESSION_ID.test(payload.session_id) ? payload.session_id : null,
+    session_id: sessionId,
   });
-  const reason = zero && judged.reason !== null ? `${judged.reason}\n${GUESS}` : judged.reason;
-  return exhausted ? null : answer(named(root, reason));
+  if (exhausted || judged.reason === null) return null;
+  // Said to the agent and kept out of the record: only a stop with a session can be let through next time.
+  const once = judged.run.verdict === "timed_out" && sessionId !== null ? [ONCE] : [];
+  return answer(named(root, [judged.reason, ...once, ...(zero ? [GUESS] : [])].join("\n")));
 }
 
 const inside = (dir, target) => {
@@ -283,6 +305,7 @@ async function gate(payload, { totalMs = BUDGET_MS, startedAt = STARTED, project
   charged.clear();
   unwritable.clear();
   heldReasons.length = 0;
+  notes.length = 0;
   current = null;
   timedOut = false;
   if (!isObject(payload)) return boundedByAll(`Krites blocked the stop: the hook payload is not an object. ${ADVICE}`, { projectDir });
@@ -315,10 +338,19 @@ function guarded(payload, options = {}) {
   return Promise.race([gate(payload, settings), watchdog]).finally(() => clearTimeout(timer));
 }
 
+// Shown to the user and never handed to the model, so an allowed stop can still say what it did not check.
+const told = (lines) => (lines.length === 0 ? "" : JSON.stringify({ systemMessage: lines.join("\n") }));
+
 if (require.main === module) {
   hookio.run({
-    handle: async (payload) => block(await guarded(payload)),
-    fail: (what) => block(boundedByAll(`Krites blocked the stop: the gate hook ${what}. ${ADVICE}`)),
+    handle: async (payload) => {
+      if (power.isOff()) return told(power.note());
+      const reason = await guarded(payload);
+      // Turned off while the checks ran: the run stays recorded, and the stop goes through.
+      if (power.isOff()) return told(power.note());
+      return block(reason) || told(notes);
+    },
+    fail: (what) => (power.isOff() ? told(power.note()) : block(boundedByAll(`Krites blocked the stop: the gate hook ${what}. ${ADVICE}`))),
   });
 }
 

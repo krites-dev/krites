@@ -744,3 +744,139 @@ test("protect: a deny on a later path key records nothing for the earlier one, a
   assert.deepStrictEqual(await runHook(PROTECT, editAs("s1", path.join(fresh, "src", "a.rs"), repo)), SILENT);
   assert.deepStrictEqual(touchedLines(repo), [`s1\t${fs.realpathSync.native(fresh)}\t`]);
 });
+
+const OUTSIDE = /outside the repository/;
+const ASK_PLAN =
+  "Krites: plan.md is outside the repository, so the user decides this edit. A folder listed under [protect].allow_outside in Krites's user config is never asked about.";
+const asking = (mode, file) => ({ permission_mode: mode, tool_input: { file_path: file } });
+const isAsk = (found) => found !== null && typeof found === "object" && Object.keys(found).join() === "ask";
+
+test("protect: an edit outside the repo is asked where a person can answer, and denied in every other mode", async () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  const file = path.join(makeDir(), "notes", "plan.md");
+
+  for (const mode of ["default", "acceptEdits", "plan", "auto"]) {
+    assert.deepStrictEqual(decide(asking(mode, file), roots), { ask: ASK_PLAN }, mode);
+  }
+  for (const mode of ["bypassPermissions", "dontAsk", "manual", "", undefined, null, 42, ["default"]]) {
+    assert.match(decide(asking(mode, file), roots), OUTSIDE, String(mode));
+  }
+  assert.strictEqual(decide(asking("default", path.join(repo, "src", "lib.rs")), roots), null, "inside the repo nothing is asked");
+
+  const asked = await runHook(PROTECT, { ...edit({ file_path: file }, repo), permission_mode: "auto" });
+  assert.deepStrictEqual([asked.code, asked.stderr], [0, ""]);
+  assert.deepStrictEqual(JSON.parse(asked.stdout), {
+    hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "ask", permissionDecisionReason: ASK_PLAN },
+  });
+  assertDeny(await runHook(PROTECT, { ...edit({ file_path: file }, repo), permission_mode: "bypassPermissions" }), OUTSIDE);
+});
+
+test("protect: asking never opens a protected path, the repo's own state, Krites's or Claude Code's configuration, a share or a relative path", () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  const home = makeDir({ ".claude/settings.json": "{}\n", ".claude/plans/p.md": "", ".claude.json": "{}\n", ".config/krites/config.toml": "" });
+  const ask = (file) => decide(asking("default", file), roots);
+
+  withEnv({ HOME: home, USERPROFILE: home, KRITES_CONFIG_DIR: path.join(home, ".config", "krites"), CLAUDE_CONFIG_DIR: undefined }, () => {
+    for (const [file, pattern] of [
+      [path.join(repo, "tests", "krites", "a.rs"), /is protected/],
+      [path.join(repo, "krites.toml"), /is protected/],
+      [path.join(repo, ".krites", "block-count"), /is protected/],
+      [path.join(repo, ".git", "config"), /is protected/],
+      [path.join(home, ".claude", "settings.json"), /own configuration/],
+      [path.join(home, ".claude", "plans", "p.md"), /own configuration/],
+      [path.join(home, ".claude.json"), /own configuration/],
+      [path.join(home, ".config", "krites", "off"), /own configuration/],
+      [path.join(home, ".config", "krites", "signing-key.pem"), /own configuration/],
+      ["//fileserver/share/x.txt", OUTSIDE],
+      ["notes/x.txt", /not an absolute path/],
+    ]) {
+      const reason = ask(file);
+      assert.strictEqual(typeof reason, "string", `${file} is denied, not asked`);
+      assert.match(reason, pattern, file);
+      assert.doesNotMatch(reason, ABSOLUTE, file);
+    }
+    assert.ok(isAsk(ask(path.join(home, "notes.md"))), "the home folder beside them is asked");
+  });
+});
+
+test("protect: a user config that does not load denies every outside write, asked or not", () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  const file = path.join(makeDir(), "x.txt");
+  withUserConfig("[protect\n", () => {
+    const reason = decide(asking("default", file), roots);
+    assert.strictEqual(typeof reason, "string", JSON.stringify(reason));
+    assert.match(reason, /^Blocked: x\.txt resolves outside the repository, and /);
+  });
+});
+
+test("protect: one denied path key denies the call, even when another key would only be asked", () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  const away = path.join(makeDir(), "x.txt");
+  const spec = path.join(repo, "docs", "SPEC.md");
+  for (const toolInput of [{ file_path: away, path: spec }, { file_path: spec, notebook_path: away }]) {
+    assert.match(decide({ permission_mode: "default", tool_input: toolInput }, roots), /docs\/SPEC\.md is protected/, Object.keys(toolInput).join());
+  }
+  assert.ok(isAsk(decide({ permission_mode: "default", tool_input: { file_path: path.join(repo, "src", "a.rs"), path: away } }, roots)));
+});
+
+test("protect: a path that leaves the repo by a link is denied, never asked", () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  const away = makeDir();
+  fs.symlinkSync(away, path.join(repo, "out"), "junction");
+  assert.match(decide(asking("default", path.join(repo, "out", "x.md")), roots), OUTSIDE);
+  assert.match(decide(asking("default", path.join(repo, "src", "..", "out", "deep", "x.md")), roots), OUTSIDE);
+  assert.ok(isAsk(decide(asking("default", path.join(away, "x.md")), roots)), "the same folder by its own path is asked");
+});
+
+function scratch() {
+  const session = path.join(makeDir(), "D--work-repo", "3f2b8c1e-9a4d-4e7b-8c21-5d6f7a8b9c0d");
+  const pad = path.join(session, "scratchpad");
+  fs.mkdirSync(pad, { recursive: true });
+  return { session, pad };
+}
+
+test("protect: this session's scratchpad stays writable, and nothing beside or above it does", async () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  const { session, pad } = scratch();
+  const other = path.join(session, "..", "0a1b2c3d-0000-4000-8000-000000000000", "scratchpad");
+  fs.mkdirSync(other, { recursive: true });
+  const write = (file, dir = pad) => ({ scratchpad_dir: dir, tool_input: { file_path: file } });
+  const probe = path.join(pad, "probe.js");
+
+  assert.strictEqual(decide(write(probe), roots), null);
+  assert.strictEqual(decide(write(path.join(pad, "spin", "deep", "build.js")), roots), null);
+  assert.strictEqual(decide(write(probe, `${slash(pad)}/`), roots), null, "forward slashes and a trailing one name the same folder");
+  assert.strictEqual(decide({ ...write(probe), permission_mode: "default" }, roots), null, "open, so nothing is asked");
+  assert.deepStrictEqual(await runHook(PROTECT, { ...edit({ file_path: probe }, repo), scratchpad_dir: pad }), SILENT);
+
+  for (const denied of [pad, path.join(session, "notes.md"), path.join(session, "..", "a.js"), path.join(other, "probe.js"), `${pad}${path.sep}..${path.sep}escaped.md`]) {
+    assert.match(decide(write(denied), roots), OUTSIDE, denied);
+  }
+  assert.match(decide(input(probe), roots), OUTSIDE, "no scratchpad_dir, as before Claude Code 2.1.257");
+  for (const bad of [null, 42, "", "relative/scratchpad", "\\\\fileserver\\share\\scratchpad", ["x"], path.parse(pad).root, `${pad}\0`]) {
+    assert.match(decide(write(probe, bad), roots), OUTSIDE, String(bad));
+  }
+
+  const away = makeDir();
+  fs.symlinkSync(away, path.join(pad, "escape"), "junction");
+  assert.match(decide(write(path.join(pad, "escape", "x.md")), roots), OUTSIDE, "a link inside it opens nothing");
+});
+
+test("protect: a scratchpad that is itself a link, or sits inside a repo, gains nothing", () => {
+  const repo = makeRepo({ files: { "krites.toml": CONFIG } });
+  const roots = findRoots({ cwd: repo, processCwd: tmp });
+  const { pad } = scratch();
+  fs.rmdirSync(pad);
+  fs.symlinkSync(makeDir(), pad, "junction");
+  assert.match(decide({ scratchpad_dir: pad, tool_input: { file_path: path.join(pad, "x.md") } }, roots), OUTSIDE);
+
+  const inRepo = path.join(repo, "tests", "krites", "scratchpad");
+  fs.mkdirSync(inRepo, { recursive: true });
+  assert.match(decide({ scratchpad_dir: inRepo, tool_input: { file_path: path.join(inRepo, "x.md") } }, roots), /is protected/);
+});

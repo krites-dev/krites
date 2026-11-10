@@ -1,5 +1,6 @@
 const { DEFAULT_MAX_BLOCKS, findRoots, loadConfig, onPath, testCommand, zeroRoot } = require("../lib/config.js");
 const hookio = require("../lib/hookio.js");
+const power = require("../lib/power.js");
 const {
   APPROVED,
   dropRange,
@@ -8,6 +9,7 @@ const {
   fingerprint,
   git,
   readBlockCount,
+  readLastRun,
   readZero,
   SESSION_ID,
   writeBaseline,
@@ -24,6 +26,13 @@ const NO_CHECKS = "krites.toml configures no checks, so nothing is being checked
 const SLOW_ONLY = "krites.toml runs no check at a stop; [checks].slow runs only under /krites:verify.";
 const GAVE_UP = (blocks) =>
   `in the last session the Krites stop gate gave up after ${blocks} blocked attempts, so that work ended without passing its checks. Run /krites:verify.`;
+const TIMED_OUT = "the last Krites check run in this repo timed out, so the work it judged has not passed its checks. Run /krites:verify.";
+
+// Said at every start until a run replaces the record: a stop let through on a timeout judged nothing.
+function timedOut(root) {
+  const last = readLastRun(root);
+  return isObject(last) && last.verdict === "timed_out";
+}
 
 const insideGit = (cwd) => typeof cwd === "string" && (git(cwd, ["rev-parse", "--is-inside-work-tree"]) || "").trim() === "true";
 
@@ -33,7 +42,7 @@ const say = (lines) => (lines.length === 0 ? "" : JSON.stringify({ systemMessage
 
 const isObject = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
 
-function handle(payload) {
+function report(payload) {
   const cwd = isObject(payload) ? payload.cwd : undefined;
   // A /clear can follow an interrupted turn that ran no gate, so it keeps the baseline, the approved config and any approval.
   const clearing = isObject(payload) && payload.source === "clear";
@@ -47,7 +56,7 @@ function handle(payload) {
   } catch (err) {
     lines.push(FAILED(`failed (${err.code || err.name})`));
   }
-  if (roots.length === 0) return say(!zeroed && !clearing && insideGit(cwd) ? [...lines, NUDGE] : lines);
+  if (roots.length === 0) return !zeroed && !clearing && insideGit(cwd) ? [...lines, NUDGE] : lines;
 
   for (const entry of roots) {
     // One root that cannot record its state must not cost the roots behind it their report, reset and baseline.
@@ -57,8 +66,11 @@ function handle(payload) {
       lines.push(FAILED(`failed (${err.code || err.name})`));
     }
   }
-  return say(lines);
+  return lines;
 }
+
+// While Krites is off the start still records its baseline, so a /krites:on later in the session judges from here.
+const handle = (payload) => say([...power.note(), ...report(payload)]);
 
 function startRoot(entry, lines, clearing) {
   const loaded = entry.error ? { ok: false, error: entry.error } : loadConfig(entry.root);
@@ -66,6 +78,7 @@ function startRoot(entry, lines, clearing) {
   const budget = loaded.ok ? loaded.config.checks.max_blocks : DEFAULT_MAX_BLOCKS;
   const count = readBlockCount(entry.root);
   if (count > budget) lines.push(GAVE_UP(budget));
+  else if (timedOut(entry.root)) lines.push(TIMED_OUT);
   if (count !== 0) writeBlockCount(entry.root, 0);
   if (!clearing) dropRange(entry.root, APPROVED);
   if (!loaded.ok) return lines.push(`Krites is not running: ${loaded.error}`);
@@ -82,6 +95,7 @@ function startZero(root, lines, { clearing, session }) {
   if (root === null) return false;
   const count = readBlockCount(root);
   if (count > DEFAULT_MAX_BLOCKS) lines.push(GAVE_UP(DEFAULT_MAX_BLOCKS));
+  else if (timedOut(root)) lines.push(TIMED_OUT);
   if (count !== 0) writeBlockCount(root, 0);
   const record = readZero(root);
   if (clearing) {
@@ -109,4 +123,4 @@ function startZero(root, lines, { clearing, session }) {
   return true;
 }
 
-if (require.main === module) hookio.run({ handle, fail: (what) => say([FAILED(what)]) });
+if (require.main === module) hookio.run({ handle, fail: (what) => say([...power.note(), FAILED(what)]) });

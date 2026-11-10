@@ -328,6 +328,8 @@ test("ping: a timed-out run never pings, not even when the budget lets the stop 
   const env = { KRITES_PING_ENDPOINT: sink.url };
 
   assertBlock(await runHook(GATE, stop(repo), { cwd: repo, env }), /timed out/);
+  // A changed tree, so the second stop runs the check again and it is the budget that lets it through.
+  fs.writeFileSync(path.join(repo, "a.txt"), "changed again\n");
   assert.deepStrictEqual(await runHook(GATE, stop(repo), { cwd: repo, env }), SILENT, "the budget lets the second stop through");
 
   assert.deepStrictEqual(sink.seen, [], "a run that timed out has no 2 s to spare");

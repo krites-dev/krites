@@ -171,20 +171,78 @@ test("deadline: two roots share one budget, so hung checks answer once", { timeo
   assert.ok(Date.now() - started < 30000, "one budget for the run, not one per root");
 });
 
-test("deadline: a timing-out check spends the attempt budget and then the stop is allowed", { timeout: 120000 }, async () => {
-  const hang = hangs("pids-budget.json", '{ stdio: "ignore" }');
+const ONCE =
+  "If the checks only ran out of time, stop again without changing anything: on an unchanged tree Krites lets the stop through and tells the user the checks timed out.";
+const UNCHECKED =
+  "Krites let this stop through unchecked: its checks timed out at the last stop and nothing has changed since, so they were not run again. That work has not passed its checks. Run /krites:verify.";
+const recorded = (repo) => path.join(repo, ".krites", "last-run.json");
+
+function hungRepo(name, options = {}) {
   const repo = makeRepo({ files: { "a.txt": "a\n" } });
-  configure(repo, { commands: [hang.argv], timeoutSeconds: 1 });
+  configure(repo, { commands: [hangs(name, '{ stdio: "ignore" }').argv], timeoutSeconds: 1, ...options });
   seed(repo);
   fs.writeFileSync(path.join(repo, "a.txt"), "changed\n");
+  return repo;
+}
+
+test("deadline: a timeout blocks once, and the next stop on the unchanged tree goes through and says so", { timeout: 120000 }, async () => {
+  const repo = hungRepo("pids-once.json");
+  const baseline = readBaseline(repo);
+
+  const reason = assertBlock(await runHook(GATE, stop(repo), { cwd: repo }), /gate timed out after 1 s/);
+  assert.ok(reason.endsWith(`\n${ONCE}`), reason);
+  const timedOut = fs.readFileSync(recorded(repo), "utf8");
+  assert.strictEqual(JSON.parse(timedOut).verdict, "timed_out");
+  assert.doesNotMatch(JSON.parse(timedOut).reason, /stop again/, "the record keeps the gate's own reason");
+
+  for (const again of [2, 3]) {
+    const result = await runHook(GATE, stop(repo), { cwd: repo });
+    assert.deepStrictEqual([result.code, result.stderr], [0, ""], `stop ${again}`);
+    assert.deepStrictEqual(JSON.parse(result.stdout), { systemMessage: UNCHECKED }, `stop ${again} is told to the user, never blocked`);
+  }
+  assert.strictEqual(fs.readFileSync(recorded(repo), "utf8"), timedOut, "the record stays the run that timed out");
+  assert.strictEqual(readBlockCount(repo), 1, "one block was spent");
+  assert.strictEqual(readBaseline(repo), baseline, "nothing advances");
+
+  const start = { hook_event_name: "SessionStart", source: "startup", session_id: "s2", cwd: repo };
+  const started = await runHook(path.join(__dirname, "..", "hooks", "session.js"), start, { cwd: repo });
+  assert.deepStrictEqual(JSON.parse(started.stdout), {
+    systemMessage: "the last Krites check run in this repo timed out, so the work it judged has not passed its checks. Run /krites:verify.",
+  });
+});
+
+test("deadline: a timeout is run again in another session, with no session, after a change, and when it never had its time", { timeout: 180000 }, async () => {
+  const repo = hungRepo("pids-again.json", { maxBlocks: 8 });
+  const blocked = async (payload, what) => assertBlock(await runHook(GATE, payload, { cwd: repo }), /gate timed out after 1 s/, what);
+
+  await blocked(stop(repo));
+  await blocked({ ...stop(repo), session_id: "s2" }, "another session checks for itself");
+  const anonymous = await blocked({ hook_event_name: "Stop", cwd: repo }, "a stop with no session");
+  assert.doesNotMatch(anonymous, /stop again/, "with no session nothing is promised");
+  await blocked({ hook_event_name: "Stop", cwd: repo }, "and is never let through");
+
+  await blocked(stop(repo));
+  fs.writeFileSync(path.join(repo, "a.txt"), "changed again\n");
+  await blocked(stop(repo), "a changed tree");
+
+  const run = JSON.parse(fs.readFileSync(recorded(repo), "utf8"));
+  fs.writeFileSync(recorded(repo), JSON.stringify({ ...run, checks: run.checks.map((check) => ({ ...check, duration_ms: 100 })) }));
+  await blocked(stop(repo), "a run cut short long before this stop's deadline");
+  assert.strictEqual(readBlockCount(repo), 7);
+});
+
+test("deadline: a timing-out check on a tree that keeps changing spends the attempt budget, and then the stop is allowed", { timeout: 120000 }, async () => {
+  const repo = hungRepo("pids-budget.json");
   const baseline = readBaseline(repo);
 
   for (let attempt = 1; attempt <= 3; attempt += 1) {
+    fs.writeFileSync(path.join(repo, "a.txt"), `changed ${attempt}\n`);
     assertBlock(await runHook(GATE, stop(repo), { cwd: repo }), /gate timed out after 1 s/);
   }
+  fs.writeFileSync(path.join(repo, "a.txt"), "changed 4\n");
   assert.deepStrictEqual(await runHook(GATE, stop(repo), { cwd: repo }), { code: 0, stdout: "", stderr: "" });
 
-  const run = JSON.parse(fs.readFileSync(path.join(repo, ".krites", "last-run.json"), "utf8"));
+  const run = JSON.parse(fs.readFileSync(recorded(repo), "utf8"));
   assert.strictEqual(run.verdict, "timed_out", "an exhausted timeout keeps its own verdict");
   assert.strictEqual(run.reason, "attempt budget exhausted");
   assert.strictEqual(readBaseline(repo), baseline, "nothing advances");

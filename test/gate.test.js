@@ -83,6 +83,8 @@ test("gate: a passing gate spends nothing and gives the next failures a full bud
   assert.strictEqual(readBlockCount(repo), 0, "a pass resets the budget");
 
   fs.writeFileSync(flag, "bad");
+  // The flag is outside the tree, so the tree changes too: on an unchanged one the pass would be carried.
+  fs.writeFileSync(path.join(repo, "a.txt"), "changed again\n");
   for (let attempt = 1; attempt <= 3; attempt += 1) assertBlock(await runHook(GATE, stop(repo), { cwd: repo }), /refuted/);
   assert.deepStrictEqual(await runHook(GATE, stop(repo), { cwd: repo }), SILENT);
 });
@@ -376,10 +378,18 @@ test("gate: a pass that cannot record its baseline spends the budget like any ot
   fs.writeFileSync(path.join(repo, ".krites", "session-head", "held.txt"), "held\n");
 
   for (let attempt = 1; attempt <= 3; attempt += 1) {
+    // A new tree each time, so the checks run: the pass is on record before the baseline write fails.
+    fs.writeFileSync(path.join(repo, "a.txt"), `attempt ${attempt}\n`);
     assertBlock(await runHook(GATE, stop(repo), { cwd: repo }), /the gate hook failed \(E[A-Z]+\)/);
     assert.strictEqual(readBlockCount(repo), attempt, "a pass that throws afterwards resets nothing");
   }
+  fs.writeFileSync(path.join(repo, "a.txt"), "attempt 4\n");
   assert.deepStrictEqual(await runHook(GATE, stop(repo), { cwd: repo }), SILENT);
+  assert.strictEqual(lastRun(repo).verdict, "passed");
+  assert.strictEqual(readBaseline(repo), null, "the baseline was never written");
+
+  assert.deepStrictEqual(await runHook(GATE, stop(repo), { cwd: repo }), SILENT, "the recorded pass is carried on the unchanged tree");
+  assert.strictEqual(readBlockCount(repo), 0, "a carried pass gives the attempts back");
 });
 
 test("gate: a crash is charged to the root it happened in, and a spent root lets the next one be judged", async () => {
@@ -868,6 +878,9 @@ test("gate: a stop on the tree /krites:verify passed carries its slow results, a
   await runCli(["verify"], { cwd: refuted });
   assert.strictEqual(lastRun(refuted).verdict, "passed");
   fs.writeFileSync(marker, "x");
+  assert.deepStrictEqual(await runHook(GATE, stop(refuted), { cwd: refuted }), SILENT, "the tree verify passed is not checked a second time");
+  assert.strictEqual(lastRun(refuted).checks.length, 2, "the whole verified run stays the record");
+  fs.writeFileSync(path.join(refuted, "a.txt"), "changed again\n");
   assertBlock(await runHook(GATE, stop(refuted), { cwd: refuted }), /check\d+\.js/);
   const run = lastRun(refuted);
   assert.deepStrictEqual([run.verdict, run.checks.length], ["refuted", 1], "a refuted stop carries nothing");
@@ -1210,4 +1223,63 @@ test("gate: a passing /krites:verify records its content too", async () => {
   const run = lastRun(repo);
   assert.strictEqual(run.verdict, "passed");
   assert.strictEqual(run.content, contentHash(repo, run.head));
+});
+
+// The check appends to a file outside the repo, so the tree's fingerprint never moves and each run is counted.
+function counting() {
+  const file = path.join(makeDir(), "runs.txt");
+  return {
+    argv: script(`require("node:fs").appendFileSync(${JSON.stringify(file)}, "x");`),
+    runs: () => (fs.existsSync(file) ? fs.readFileSync(file, "utf8").length : 0),
+  };
+}
+
+test("gate: a tree unchanged since its checks passed goes through without running them, in any session", async () => {
+  const check = counting();
+  const repo = repoWith({ commands: [check.argv] });
+  const file = path.join(repo, ".krites", "last-run.json");
+  assert.deepStrictEqual(await runHook(GATE, stop(repo), { cwd: repo }), SILENT);
+  assert.strictEqual(check.runs(), 1);
+  const passed = fs.readFileSync(file, "utf8");
+  assert.strictEqual(JSON.parse(passed).verdict, "passed");
+
+  writeBlockCount(repo, 2);
+  for (const extra of [{}, { session_id: "s2" }, { session_id: undefined }]) {
+    assert.deepStrictEqual(await runHook(GATE, stop(repo, extra), { cwd: repo }), SILENT);
+  }
+  assert.strictEqual(check.runs(), 1, "the pass is carried, not run again");
+  assert.strictEqual(fs.readFileSync(file, "utf8"), passed, "a carried pass writes no run");
+  assert.strictEqual(readBlockCount(repo), 0, "a tree that passed holds nothing that blocked");
+});
+
+test("gate: a change to the tree, its HEAD, its krites.toml or the recorded pass runs the checks again", async () => {
+  const check = counting();
+  const repo = repoWith({ commands: [check.argv] });
+  const file = path.join(repo, ".krites", "last-run.json");
+  const stops = async (runs, what) => {
+    assert.deepStrictEqual(await runHook(GATE, stop(repo), { cwd: repo }), SILENT, what);
+    assert.strictEqual(check.runs(), runs, what);
+  };
+  await stops(1, "the first stop");
+  await stops(1, "nothing changed");
+  fs.writeFileSync(path.join(repo, "a.txt"), "edited\n");
+  await stops(2, "a tracked file edited");
+  fs.writeFileSync(path.join(repo, "new.txt"), "new\n");
+  await stops(3, "an untracked file added");
+  git(repo, "add", "-A");
+  git(repo, "commit", "-q", "-m", "work");
+  await stops(4, "a commit moved HEAD");
+  fs.writeFileSync(path.join(repo, "a.txt"), "edited again\n");
+  await stops(5, "edited after the commit");
+
+  const forge = (change) => fs.writeFileSync(file, JSON.stringify({ ...lastRun(repo), ...change }));
+  forge({ config_hash: "another" });
+  await stops(6, "a pass under another krites.toml");
+  forge({ checks: lastRun(repo).checks.map((entry) => ({ ...entry, exit_code: 1 })) });
+  await stops(7, "a pass whose check failed is not one the gate wrote");
+  forge({ checks: [] });
+  await stops(8, "a pass with no check");
+  forge({ verdict: "refuted", reason: "no" });
+  await stops(9, "a refuted run");
+  await stops(9, "and the pass after all of them is carried again");
 });

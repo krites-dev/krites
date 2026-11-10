@@ -16,6 +16,8 @@ const BANG = {
   telemetry: "telemetry",
   "telemetry-on": "telemetry on",
   "telemetry-off": "telemetry off",
+  off: "off",
+  on: "on",
 };
 const NAMES = fs.readdirSync(COMMANDS).filter((file) => file.endsWith(".md")).map((file) => file.slice(0, -3));
 const ONE_BLOCK = "inside one fenced code block, exactly as printed, and nothing else: every line of it inside the block";

@@ -5,6 +5,7 @@ const path = require("node:path");
 const { enclosingRoots, findRoots, loadConfig, loadUserConfig, protectedGlobs, zeroConfig, zeroEntry } = require("../lib/config.js");
 const { matches } = require("../lib/glob.js");
 const hookio = require("../lib/hookio.js");
+const power = require("../lib/power.js");
 const { configDir } = require("../lib/sign.js");
 const state = require("../lib/state.js");
 
@@ -12,6 +13,12 @@ const PATH_KEYS = ["file_path", "path", "notebook_path"];
 const UNC = /^[\\/]{2}(?:[?.][\\/]UNC[\\/]|(?![?.][\\/]))/i;
 const WINDOWS = process.platform === "win32";
 const HEAD_TIMEOUT_MS = 4000;
+// The modes where Claude Code can put a prompt in front of a person. In every other one an outside edit is denied.
+const ASKABLE = new Set(["default", "acceptEdits", "plan", "auto"]);
+const ASK = (name) =>
+  `Krites: ${name} is outside the repository, so the user decides this edit. A folder listed under [protect].allow_outside in Krites's user config is never asked about.`;
+
+const isAsk = (found) => found !== null && typeof found === "object";
 
 function lexists(file) {
   try {
@@ -48,6 +55,20 @@ function memoryDirOf(payload) {
   }
 }
 
+// Claude Code names the session's scratchpad in every payload. As with memory, the parent is resolved and the folder
+// is not, so a scratchpad that is a link stays closed.
+function scratchpadDirOf(payload) {
+  const raw = payload.scratchpad_dir;
+  if (typeof raw !== "string" || raw.includes("\0") || !path.isAbsolute(raw) || UNC.test(raw)) return null;
+  const dir = path.resolve(raw);
+  if (path.dirname(dir) === dir) return null;
+  try {
+    return path.join(realTarget(path.dirname(dir)), path.basename(dir));
+  } catch {
+    return null;
+  }
+}
+
 function inside(dir, target) {
   const rel = path.relative(dir, target).replace(/\\/g, "/");
   return rel !== "" && rel !== ".." && !rel.startsWith("../") && !path.isAbsolute(rel);
@@ -63,9 +84,9 @@ function resolved(dir) {
   }
 }
 
-// Only the user's own config.toml opens a path outside every repo, and never the folders that hold the signing key,
-// that config, or Claude Code's own settings. The target is already resolved, so a link cannot lead past these.
-function outsideReason(target, name, outside) {
+// The user's own config.toml opens a path outside every repo, and a person at the prompt lets one edit through. Neither
+// reaches the folders that hold the signing key, that config, or Claude Code's own settings.
+function outsideReason(target, name, outside, asked) {
   const { root } = path.parse(target);
   const rest = target.slice(root.length);
   if (WINDOWS && rest.includes(":")) return `Blocked: ${name} names an alternate data stream.`;
@@ -77,9 +98,19 @@ function outsideReason(target, name, outside) {
   const clean = path.join(root, ...parts);
   const expand = (entry) => (/^~[\\/]/.test(entry) ? path.join(home, entry.slice(2)) : entry);
   const fold = WINDOWS || process.platform === "darwin";
-  if (!loaded.allowOutside.some((entry) => matches(expand(entry), clean, { fold }))) return outside;
+  const listed = loaded.allowOutside.some((entry) => matches(expand(entry), clean, { fold }));
+  if (!listed && !asked) return outside;
   if (ownConfig(clean)) return `Blocked: ${name} is in Claude Code's or Krites's own configuration, which allow_outside never opens.`;
-  return null;
+  return listed ? null : { ask: ASK(name) };
+}
+
+// True when the path as written runs through a root before a link carries it out: the prompt would show a path in the repo.
+function throughRepo(file, roots) {
+  for (let dir = path.dirname(path.resolve(file)); ; dir = path.dirname(dir)) {
+    const real = resolved(dir);
+    if (roots.some((entry) => within(entry.root, real))) return true;
+    if (path.dirname(dir) === dir) return false;
+  }
 }
 
 // The folders that hold the signing key, the user config and Claude Code's settings, and Claude Code's global files.
@@ -104,7 +135,8 @@ function ownConfig(clean) {
   return own.some((dir) => within(key(dir), key(clean))) || globalFile(clean) || key(tidy(linkedJson)) === key(clean);
 }
 
-function reasonFor(file, roots, configs, memoryOf, touched) {
+// A string denies, { ask } hands the edit to Claude Code's permission prompt, and null lets it through.
+function reasonFor(file, roots, configs, session, touched) {
   if (typeof file !== "string" || file.includes("\0")) return "Blocked: the edit path is not a plain string.";
   // Either separator: on POSIX a backslash path is one long file name, and the reason must not echo it whole.
   const name = file.split(/[\\/]/).filter(Boolean).pop() || "the path";
@@ -121,9 +153,9 @@ function reasonFor(file, roots, configs, memoryOf, touched) {
     if (!best || entry.root.length > best.entry.root.length) best = { entry, rel };
   }
   if (!best) {
-    const memory = memoryOf();
-    const allowed = memory && inside(memory, target) && !(WINDOWS && path.relative(memory, target).includes(":"));
-    return allowed ? null : outsideReason(target, name, outside);
+    if (session.dirs().some((dir) => inside(dir, target) && !(WINDOWS && path.relative(dir, target).includes(":")))) return null;
+    const reason = outsideReason(target, name, outside, session.asked);
+    return isAsk(reason) && throughRepo(file, roots) ? outside : reason;
   }
   if (WINDOWS && best.rel.includes(":")) return `Blocked: ${name} names an alternate data stream.`;
 
@@ -224,32 +256,42 @@ function decide(payload, roots, zero = null) {
   if (input === undefined) return null;
   if (input === null || typeof input !== "object" || Array.isArray(input)) return "Blocked: the tool input is not an object.";
   try {
-    let memory;
-    const memoryOf = () => (memory === undefined ? (memory = memoryDirOf(payload)) : memory);
+    let dirs;
+    // The session's own folders outside the repo: this project's memory and this session's scratchpad.
+    const session = {
+      dirs: () => (dirs === undefined ? (dirs = [memoryDirOf(payload), scratchpadDirOf(payload)].filter(Boolean)) : dirs),
+      asked: ASKABLE.has(payload.permission_mode),
+    };
     const touched = [];
+    let ask = null;
+    // Every key is judged before anything is asked: a deny on a later key outranks the question.
     for (const key of PATH_KEYS) {
       if (input[key] === undefined || input[key] === null || input[key] === "") continue;
-      const reason = reasonFor(input[key], roots, configs, memoryOf, touched);
-      if (reason) return reason;
+      const reason = reasonFor(input[key], roots, configs, session, touched);
+      if (typeof reason === "string") return reason;
+      ask = ask || reason;
     }
     remember(payload.session_id, touched, roots);
-    return null;
+    return ask;
   } catch (err) {
     return `Blocked: the edit path could not be resolved (${err.code || err.name}).`;
   }
 }
 
-const deny = (reason) =>
-  reason ? JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason } }) : "";
+const output = (permissionDecision, permissionDecisionReason) =>
+  JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision, permissionDecisionReason } });
+const deny = (reason) => (reason ? output("deny", reason) : "");
+const answer = (found) => (isAsk(found) ? output("ask", found.ask) : deny(found));
 
 if (require.main === module) {
   hookio.run({
     handle: (payload) => {
+      if (power.isOff()) return "";
       const where = { cwd: payload && payload.cwd, projectDir: process.env.CLAUDE_PROJECT_DIR };
       const roots = findRoots(where);
-      return deny(decide(payload, roots, roots.length === 0 ? zeroEntry(where) : null));
+      return answer(decide(payload, roots, roots.length === 0 ? zeroEntry(where) : null));
     },
-    fail: (what) => deny(`Blocked: the protect hook ${what}.`),
+    fail: (what) => (power.isOff() ? "" : deny(`Blocked: the protect hook ${what}.`)),
   });
 }
 

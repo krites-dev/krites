@@ -668,3 +668,12 @@ test("zero-config commands: the same holds for a session that started before the
   git(repo, "commit", "-q", "-m", "first");
   await approvedAfterInit(repo);
 });
+
+test("zero-config: a startup says when the last check run timed out", async () => {
+  const TIMED_OUT = "the last Krites check run in this repo timed out, so the work it judged has not passed its checks. Run /krites:verify.";
+  const { repo } = zeroRepo();
+  await started(repo);
+  fs.writeFileSync(krites(repo, "last-run.json"), JSON.stringify({ verdict: "timed_out" }));
+  assert.strictEqual(await started(repo), `${TIMED_OUT}\n${LINE("npm test")}`);
+  assert.strictEqual(message(await runHook(SESSION, start(repo, "clear"), { cwd: repo })), TIMED_OUT);
+});

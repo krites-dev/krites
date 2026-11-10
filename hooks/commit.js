@@ -4,6 +4,7 @@ const path = require("node:path");
 
 const { findRoots, loadConfig } = require("../lib/config.js");
 const hookio = require("../lib/hookio.js");
+const power = require("../lib/power.js");
 const { gitCommits } = require("../lib/shell.js");
 const state = require("../lib/state.js");
 const { deny } = require("./protect.js");
@@ -103,6 +104,6 @@ function decide(payload) {
 }
 
 // The hook sits on every shell call, so a crash or a bad payload lets the call through rather than stall the agent.
-if (require.main === module) hookio.run({ handle: (payload) => deny(decide(payload)), fail: () => "" });
+if (require.main === module) hookio.run({ handle: (payload) => (power.isOff() ? "" : deny(decide(payload))), fail: () => "" });
 
 module.exports = { decide };

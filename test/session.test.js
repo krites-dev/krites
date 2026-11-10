@@ -243,3 +243,24 @@ test("session: a /clear keeps an approval along with the baseline it was made ag
   assert.strictEqual(fs.readFileSync(approved, "utf8"), pair);
   assert.deepStrictEqual(await runHook(GATE, stop(repo), { cwd: repo }), SILENT, "the next stop is still excused");
 });
+
+const TIMED_OUT = "the last Krites check run in this repo timed out, so the work it judged has not passed its checks. Run /krites:verify.";
+
+test("session: a start says when the last check run timed out, until a run replaces it, and the gave-up line outranks it", async () => {
+  const repo = makeRepo({ files: { "a.txt": "a\n" } });
+  configure(repo, { commands: [script("process.exit(0)")] });
+  const file = path.join(repo, ".krites", "last-run.json");
+  const record = (text) => (fs.mkdirSync(path.dirname(file), { recursive: true }), fs.writeFileSync(file, text));
+  assert.deepStrictEqual(await runHook(SESSION, start(repo), { cwd: repo }), SILENT);
+
+  record(JSON.stringify({ verdict: "timed_out" }));
+  assert.strictEqual(message(await runHook(SESSION, start(repo), { cwd: repo })), TIMED_OUT);
+  assert.strictEqual(message(await runHook(SESSION, { ...start(repo), source: "clear" }, { cwd: repo })), TIMED_OUT);
+  writeBlockCount(repo, 4);
+  assert.strictEqual(message(await runHook(SESSION, start(repo), { cwd: repo })), GAVE_UP);
+
+  for (const text of [JSON.stringify({ verdict: "passed" }), JSON.stringify({ verdict: "refuted" }), "null", "[]", "not json"]) {
+    record(text);
+    assert.deepStrictEqual(await runHook(SESSION, start(repo), { cwd: repo }), SILENT, text);
+  }
+});

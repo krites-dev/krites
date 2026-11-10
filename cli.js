@@ -4,6 +4,7 @@ const path = require("node:path");
 const gate = require("./hooks/gate.js");
 const { detect, loadConfig, parseToml, protectedGlobs } = require("./lib/config.js");
 const ping = require("./lib/ping.js");
+const power = require("./lib/power.js");
 const receipts = require("./lib/receipt.js");
 const { scrub } = require("./lib/scrub.js");
 const settings = require("./lib/settings.js");
@@ -31,7 +32,7 @@ const GLOBS = [
 const MARKERS = "Cargo.toml, package.json, pyproject.toml, pytest.ini or go.mod";
 const NO_CHECKS = "krites.toml configures no checks, so nothing ran.";
 const NO_ROOT = "This repo has no krites.toml, so Krites is checking nothing. Run /krites:init.";
-const USAGE = "usage: /krites:init, /krites:init-write, /krites:approve, /krites:approve-write, /krites:verify, /krites:receipt, /krites:telemetry, /krites:telemetry-on, /krites:telemetry-off";
+const USAGE = "usage: /krites:init, /krites:init-write, /krites:approve, /krites:approve-write, /krites:verify, /krites:receipt, /krites:telemetry, /krites:telemetry-on, /krites:telemetry-off, /krites:off, /krites:on";
 
 const lines = [];
 const say = (text, root) => lines.push(scrub(String(text), root));
@@ -371,12 +372,19 @@ async function run(name, args, options) {
     if (telemetry(args) === false) say(USAGE, process.cwd());
     return;
   }
+  // The switch answers in one line and asks nothing after it: a person turning Krites off is not asked about telemetry.
+  if (name === "off" || name === "on") {
+    if (args.length > 0) return say(USAGE, process.cwd());
+    power.set(name === "off");
+    return say(name === "off" ? power.TURNED_OFF : power.TURNED_ON, process.cwd());
+  }
   if (name === "init") {
     if (init(args) === false) return say(USAGE, process.cwd());
   } else if (name === "approve" && (args.length === 0 || (args.length === 1 && args[0] === "--write"))) await approveCommits(args.length === 1);
   else if (args.length === 0 && name === "verify") await verify(options);
   else if (args.length === 0 && name === "receipt") await receipt();
   else return say(USAGE, process.cwd());
+  if (name === "verify") for (const line of power.note()) say(line, process.cwd());
   // Consent is asked from a command and never from a hook, so the question closes the ones that have output.
   const asked = ping.question();
   if (asked !== null) say(asked, process.cwd());
