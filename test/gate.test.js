@@ -7,7 +7,7 @@ const { test } = require("node:test");
 
 const { loadConfig } = require("../lib/config.js");
 const { contentHash, readBaseline, readBlockCount, readConfigHash, trimTouched, writeBlockCount } = require("../lib/state.js");
-const { ABSOLUTE, assertBlock, configure, FAKE, fromTmp, git, head, makeDir, makeRepo, runCli, runHook, script, seed, textOf, tmp, toml } = require("./helpers.js");
+const { ABSOLUTE, assertBlock, configure, FAKE, fromTmp, git, head, makeDir, makeRepo, runCli, runHook, script, seed, textOf, tmp, toml, trust } = require("./helpers.js");
 
 const GATE = path.join(__dirname, "..", "hooks", "gate.js");
 const SILENT = { code: 0, stdout: "", stderr: "" };
@@ -737,6 +737,8 @@ test("gate: the first blocking root wins and later roots never run their checks"
   fs.writeFileSync(path.join(outer, "krites.toml"), toml({ commands: [fail()] }));
   git(outer, "add", "-A");
   git(outer, "commit", "-q", "-m", "config");
+  trust(inner);
+  trust(outer);
 
   const payload = stop(outer);
   assertBlock(await runHook(GATE, payload, { cwd: outer, env: { CLAUDE_PROJECT_DIR: inner.replace(/\\/g, "/") } }), /refuted/);
@@ -1069,6 +1071,7 @@ test("gate: a line recorded with an empty head gives way to the session's first 
   fs.mkdirSync(nested, { recursive: true });
   git(nested, "init", "-q");
   fs.writeFileSync(path.join(nested, "krites.toml"), toml({ commands: [pass()], globs: ["fixtures/**"] }));
+  trust(nested);
   const write = (rel) => ({ hook_event_name: "PreToolUse", tool_name: "Write", session_id: "s1", cwd: repo, tool_input: { file_path: path.join(nested, rel) } });
   assert.deepStrictEqual(await runHook(PROTECT, write("a.txt")), SILENT, "no commit yet, so the head is empty");
   git(nested, "add", "-A");

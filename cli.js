@@ -9,6 +9,7 @@ const receipts = require("./lib/receipt.js");
 const { scrub } = require("./lib/scrub.js");
 const settings = require("./lib/settings.js");
 const state = require("./lib/state.js");
+const trust = require("./lib/trust.js");
 const { matches } = require("./lib/glob.js");
 
 // The Bash tool delivers a run of up to 600 s when the model passes the parameter (spikes/claude-plugin/NOTES.md);
@@ -145,6 +146,7 @@ function approve(root, write) {
   // New globs can protect a path no approval showed, so an accepted config ends any approval first.
   state.dropRange(root, state.APPROVED);
   state.writeConfigHash(root, loaded.hash);
+  trust.trustConfig(root, loaded.hash);
   say("The gate now accepts this krites.toml.", root);
 }
 
@@ -163,7 +165,9 @@ function init(args) {
   if (!write) return say("Nothing was written. Run /krites:init-write to create it.", root);
   fs.writeFileSync(path.join(root, "krites.toml"), text, { flag: "wx" });
   state.dropRange(root, state.APPROVED);
-  state.writeConfigHash(root, state.hashText(text));
+  const hash = state.hashText(text);
+  state.writeConfigHash(root, hash);
+  trust.trustConfig(root, hash);
   say("krites.toml is written and the gate accepts it. Run /krites:verify to run the checks now.", root);
 }
 
@@ -260,7 +264,10 @@ function approveWrite(root, loaded, { baseline, head }) {
   const blob = shown(root, ["cat-file", "blob", `${head}:./krites.toml`]);
   const config = seen.rels.includes("krites.toml") && blob !== null && state.hashText(blob) === loaded.hash;
   state.writeRange(root, state.APPROVED, pending);
-  if (config) state.writeConfigHash(root, loaded.hash);
+  if (config) {
+    state.writeConfigHash(root, loaded.hash);
+    trust.trustConfig(root, loaded.hash);
+  }
   const out = [`Approved these protected changes up to ${short(root, head)}:`, ...listed(seen.rels), ...seen.log];
   say([...out, ...(config ? ["The gate now accepts this krites.toml."] : []), STILL].join("\n"), root);
 }
@@ -332,6 +339,7 @@ async function checkRoot(root, loaded, { capMs, startedAt, recorded }) {
     if (err === SPENT) return say(spentLine(capMs), root);
     throw err;
   }
+  if (judged.untrusted) return say(judged.verifyReason, root);
   if (judged.failed) return say(`${judged.failed}.`, root);
 
   gate.recordRun(root, loaded, judged, { head, dirty, baseline, reason: judged.reason, session_id: null });

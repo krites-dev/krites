@@ -88,12 +88,23 @@ async function fromTmp(run) {
   }
 }
 
+// Record a repo's krites.toml as approved in the test's user config dir.
+function trust(root, dir = process.env.KRITES_CONFIG_DIR) {
+  const state = require("../lib/state.js");
+  const hash = state.configHash(root);
+  if (hash !== null) require("../lib/trust.js").trustConfig(root, hash, dir);
+  return root;
+}
+
 // What session.js records at startup: the baseline HEAD and the hash of the config it read.
 function seed(root, gitRoot = root) {
   const state = require("../lib/state.js");
   state.writeBaseline(root, head(gitRoot));
   const hash = state.configHash(root);
-  if (hash !== null) state.writeConfigHash(root, hash);
+  if (hash !== null) {
+    state.writeConfigHash(root, hash);
+    require("../lib/trust.js").trustConfig(root, hash);
+  }
   return root;
 }
 
@@ -152,10 +163,11 @@ function toml({ commands = [], slow, timeoutSeconds, maxBlocks, globs } = {}) {
 }
 
 // Committed, because an untracked krites.toml is itself a changed protected path.
-function configure(repo, options) {
+function configure(repo, options, { approved = true } = {}) {
   fs.writeFileSync(path.join(repo, "krites.toml"), typeof options === "string" ? options : toml(options));
   git(repo, "add", "krites.toml");
   git(repo, "commit", "-q", "-m", "config");
+  if (approved) trust(repo);
   return repo;
 }
 
@@ -240,4 +252,5 @@ module.exports = {
   textOf,
   tmp,
   toml,
+  trust,
 };

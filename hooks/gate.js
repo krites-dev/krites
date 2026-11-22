@@ -9,6 +9,7 @@ const power = require("../lib/power.js");
 const { wellFormed } = require("../lib/receipt.js");
 const { scrub } = require("../lib/scrub.js");
 const state = require("../lib/state.js");
+const trust = require("../lib/trust.js");
 
 const VERSION = require("../.claude-plugin/plugin.json").version;
 const ADVICE = "Fix it and let the checks run before stopping. Do not describe results; the gate reads them.";
@@ -153,10 +154,21 @@ async function judge(root, loaded, { head, baseline, ownBaseline = true, deadlin
   const before = state.fingerprint(root);
   const content = state.contentHash(root, head);
   // Zero-config runs its one command and nothing else: with no krites.toml there is no protected path to judge.
-  const found = loaded.zero ? { record: null, paths: [] } : protectedChanges(root, loaded, baseline, ownBaseline);
+  const found = loaded.zero ? { record: null, changed: [], paths: [] } : protectedChanges(root, loaded, baseline, ownBaseline);
   if (found === null) return { failed: UNLISTED };
 
   const { record } = found;
+  if (!loaded.zero && !trust.isTrusted(root, loaded.hash)) {
+    const prev = trust.trustedHash(root);
+    const localEdit = prev !== null && ((record !== null && record === prev) || found.changed.includes("krites.toml"));
+    if (!localEdit) {
+      return {
+        untrusted: true,
+        reason: prev === null ? trust.UNAPPROVED_STOP : trust.CHANGED_STOP,
+        verifyReason: prev === null ? trust.UNAPPROVED_VERIFY : trust.CHANGED_VERIFY,
+      };
+    }
+  }
   const touched = found.paths[0];
   const deadlineMs = deadline();
   const run = touched ? { verdict: "refuted", checks: [], failed: null } : await runChecks({ commands, env: config.checks.env, root, deadlineMs });
@@ -227,7 +239,9 @@ async function runRoot({ root, recorded, zero, label }, loaded, payload, budget)
   const own = zero && (zero.session === null || zero.session === payload.session_id);
   const unchanged = own && listed && zero.fingerprint !== null && state.fingerprint(root) === zero.fingerprint;
   const settled = (!dirty && baseline !== null && baseline === head) || unchanged;
-  const last = settled || !listed ? null : sameTreeRun(root, loaded);
+  const trusted = loaded.zero || trust.isTrusted(root, loaded.hash);
+  // Never carry a pass from a krites.toml that the user has not approved in their own config dir.
+  const last = settled || !listed || !trusted ? null : sameTreeRun(root, loaded);
   // The checks already passed on this very tree, in a stop or under /krites:verify, so the pass is carried.
   if (settled || (last !== null && last.verdict === "passed")) {
     // A clean tree at the baseline holds nothing the blocks were about, so the attempts go back.
@@ -249,6 +263,7 @@ async function runRoot({ root, recorded, zero, label }, loaded, payload, budget)
   }
 
   const judged = await judge(root, loaded, { head, baseline, ownBaseline, deadline });
+  if (judged.untrusted) return answer(judged.reason, true);
   if (judged.failed) {
     const reason = `Krites blocked the stop: ${judged.failed}. ${ADVICE}`;
     // Git could not say what changed: nothing was judged, so it is no attempt, and it blocks until it is fixed.

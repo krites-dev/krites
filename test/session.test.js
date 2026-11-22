@@ -5,7 +5,8 @@ const path = require("node:path");
 const { test } = require("node:test");
 
 const { readBlockCount, writeBlockCount } = require("../lib/state.js");
-const { ABSOLUTE, assertBlock, configure, git, head, makeDir, makeRepo, runCli, runHook, script, toml } = require("./helpers.js");
+const { CHANGED_SESSION } = require("../lib/trust.js");
+const { ABSOLUTE, assertBlock, configure, git, head, makeDir, makeRepo, runCli, runHook, script, toml, trust } = require("./helpers.js");
 
 const GATE = path.join(__dirname, "..", "hooks", "gate.js");
 const SESSION = path.join(__dirname, "..", "hooks", "session.js");
@@ -152,6 +153,8 @@ test("session: one root that cannot record its baseline does not cost the next r
   fs.writeFileSync(path.join(outer, "krites.toml"), toml({ commands: [script("")] }));
   git(outer, "add", "-A");
   git(outer, "commit", "-q", "-m", "config");
+  trust(inner);
+  trust(outer);
   writeBlockCount(inner, 4);
   writeBlockCount(outer, 4);
   // Not empty, so the plugin's own repair cannot clear it and the baseline write really fails.
@@ -168,13 +171,16 @@ test("session: one root that cannot record its baseline does not cost the next r
   assert.strictEqual(baseline(outer), head(outer), "and gets its baseline");
 });
 
-test("session: the config hash is recorded next to the baseline", async () => {
+test("session: an approved krites.toml records its config hash next to the baseline, and an unapproved edit is not auto-approved", async () => {
   const repo = configure(makeRepo({ files: { "a.txt": "a\n" } }), { commands: [script("")] });
-  fs.appendFileSync(path.join(repo, "krites.toml"), "# edited before the session started\n");
   assert.deepStrictEqual(await runHook(SESSION, start(repo), { cwd: repo }), SILENT);
 
   const expected = crypto.createHash("sha256").update(fs.readFileSync(path.join(repo, "krites.toml"))).digest("hex");
   assert.strictEqual(fs.readFileSync(path.join(repo, ".krites", "config-hash"), "utf8").trim(), expected);
+
+  fs.appendFileSync(path.join(repo, "krites.toml"), "# edited before the session started\n");
+  assert.strictEqual(message(await runHook(SESSION, start(repo), { cwd: repo })), CHANGED_SESSION);
+  assert.strictEqual(fs.readFileSync(path.join(repo, ".krites", "config-hash"), "utf8").trim(), expected, "session start never overwrites config-hash with an unapproved config");
 });
 
 test("session: a payload that is not an object records nothing and stays silent", async () => {
@@ -189,6 +195,7 @@ test("session: a config that does not parse is reported in one line and no basel
 
 test("session: a repo with no commits writes an empty baseline", async () => {
   const repo = makeRepo({ files: { "krites.toml": toml({ commands: [script("")] }), "a.txt": "a\n" }, commit: false });
+  trust(repo);
   assert.deepStrictEqual(await runHook(SESSION, start(repo), { cwd: repo }), SILENT);
   assert.strictEqual(baseline(repo), "");
 });

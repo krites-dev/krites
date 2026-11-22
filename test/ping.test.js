@@ -8,7 +8,7 @@ const { after, test } = require("node:test");
 const gate = require("../hooks/gate.js");
 const ping = require("../lib/ping.js");
 const sign = require("../lib/sign.js");
-const { assertBlock, configure, fromTmp, makeRepo, runCli, runHook, script, seed, tmp } = require("./helpers.js");
+const { assertBlock, configure, fromTmp, makeRepo, runCli, runHook, script, seed, tmp, trust } = require("./helpers.js");
 
 const VERSION = require("../.claude-plugin/plugin.json").version;
 const GATE = path.join(__dirname, "..", "hooks", "gate.js");
@@ -274,13 +274,14 @@ test("ping: a spawned child sees neither the parent's endpoint nor its config di
   const sink = await listen();
   const child = path.join(tmp, "child-config");
   const outside = path.join(os.tmpdir(), `krites-parent-config-${process.pid}`);
+  const repo = repoWith("console.log('ok')");
+  trust(repo, child);
   const saved = { endpoint: process.env.KRITES_PING_ENDPOINT, config: process.env.KRITES_CONFIG_DIR };
   process.env.KRITES_PING_ENDPOINT = sink.url;
   process.env.KRITES_CONFIG_DIR = outside;
   const show = script("console.log(JSON.stringify([process.env.KRITES_PING_ENDPOINT || null, process.env.KRITES_CONFIG_DIR || null]));")[1];
 
   try {
-    const repo = repoWith("console.log('ok')");
     await runHook(GATE, stop(repo), { cwd: repo });
     assert.deepStrictEqual(JSON.parse((await runHook(show, null, { cwd: tmp })).stdout), ["off", child], "a hook gets neither");
     assert.match((await runCli(["telemetry"], { cwd: repo })).stdout, /KRITES_PING_ENDPOINT is set to off/, "and neither does a command");

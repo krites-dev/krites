@@ -1,6 +1,7 @@
 const { DEFAULT_MAX_BLOCKS, findRoots, loadConfig, onPath, testCommand, zeroRoot } = require("../lib/config.js");
 const hookio = require("../lib/hookio.js");
 const power = require("../lib/power.js");
+const trust = require("../lib/trust.js");
 const {
   APPROVED,
   dropRange,
@@ -84,8 +85,14 @@ function startRoot(entry, lines, clearing) {
   if (!loaded.ok) return lines.push(`Krites is not running: ${loaded.error}`);
   if (clearing) return;
   writeBaseline(entry.root, (git(entry.root, ["rev-parse", "HEAD"]) || "").trim());
-  if (loaded.hash !== undefined) writeConfigHash(entry.root, loaded.hash);
   dropZero(entry.root);
+  // A repo's krites.toml is never auto-approved at session start: only the user's own config dir grants trust.
+  const prev = trust.trustedHash(entry.root);
+  if (loaded.hash !== undefined && prev !== loaded.hash) {
+    lines.push(prev === null ? trust.UNAPPROVED_SESSION : trust.CHANGED_SESSION);
+    return;
+  }
+  if (loaded.hash !== undefined) writeConfigHash(entry.root, loaded.hash);
   const { commands, slow } = loaded.config.checks;
   if (commands.length === 0) lines.push(slow.length === 0 ? NO_CHECKS : SLOW_ONLY);
 }

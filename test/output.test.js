@@ -7,7 +7,7 @@ const { test } = require("node:test");
 
 const { scrub, TOKEN } = require("../lib/scrub.js");
 const { writeBlockCount } = require("../lib/state.js");
-const { ABSOLUTE, configure, FAKE, git, hookText, makeDir, makeRepo, runCli, runHook, script, seed, textOf, tmp, toml } = require("./helpers.js");
+const { ABSOLUTE, configure, FAKE, git, hookText, makeDir, makeRepo, runCli, runHook, script, seed, textOf, tmp, toml, trust } = require("./helpers.js");
 
 const HOOKS = path.join(__dirname, "..", "hooks");
 const PLUGIN = path.join(__dirname, "..");
@@ -172,6 +172,7 @@ test("output: a timed-out gate and a no_checks gate keep the same guarantees", {
   assertClean("gate timeout", await runHook(hook("gate"), stop(slow), { cwd: slow }));
 
   const quiet = makeRepo({ files: { "krites.toml": toml({ commands: [] }), "a.txt": "a\n" } });
+  trust(quiet);
   fs.writeFileSync(path.join(quiet, "a.txt"), "changed\n");
   assertClean("gate no_checks", await runHook(hook("gate"), stop(quiet), { cwd: quiet }));
   assert.strictEqual(JSON.parse(fs.readFileSync(path.join(quiet, ".krites", "last-run.json"), "utf8")).verdict, "no_checks");

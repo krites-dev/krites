@@ -4,7 +4,7 @@ const path = require("node:path");
 const { test } = require("node:test");
 
 const { readBaseline } = require("../lib/state.js");
-const { ABSOLUTE, assertBlock, configure, head, makeDir, makeRepo, runCli, runHook, script, seed, tmp } = require("./helpers.js");
+const { ABSOLUTE, assertBlock, configure, head, makeDir, makeRepo, runCli, runHook, script, seed, tmp, trust } = require("./helpers.js");
 
 const hook = (name) => path.join(__dirname, "..", "hooks", `${name}.js`);
 const [PROTECT, COMMIT, GATE, SESSION] = ["protect", "commit", "gate", "session"].map(hook);
@@ -37,10 +37,11 @@ function told(result) {
   return out.systemMessage;
 }
 
-function changed(check) {
+function changed(check, env) {
   const repo = makeRepo({ files: { "a.txt": "a\n", "tests/krites/t.rs": "t\n" } });
   configure(repo, { commands: [script(check)], globs: ["tests/krites/**"] });
   seed(repo);
+  if (env) trust(repo, env.KRITES_CONFIG_DIR);
   fs.writeFileSync(path.join(repo, "a.txt"), "changed\n");
   return repo;
 }
@@ -112,7 +113,7 @@ test("power: while off the commit hook holds nothing", async () => {
 
 test("power: while off a stop runs no check, blocks nothing, writes nothing and tells the user; on again it blocks", async () => {
   const env = world();
-  const repo = changed("process.exit(1)");
+  const repo = changed("process.exit(1)", env);
   await runCli(["off"], { env });
 
   assert.strictEqual(told(await runHook(GATE, stop(repo), { cwd: repo, env })), NOTE);
@@ -127,13 +128,14 @@ test("power: while off a stop runs no check, blocks nothing, writes nothing and 
 
 test("power: a gate whose checks were running when Krites was turned off lets the stop through", async () => {
   const env = world();
-  const repo = changed(`require("node:fs").writeFileSync(${JSON.stringify(marker(env))}, "x"); process.exit(1);`);
+  const repo = changed(`require("node:fs").writeFileSync(${JSON.stringify(marker(env))}, "x"); process.exit(1);`, env);
   assert.strictEqual(told(await runHook(GATE, stop(repo), { cwd: repo, env })), NOTE);
 });
 
 test("power: the session start says Krites is off first, and still records the baseline", async () => {
   const env = world();
   const repo = configure(makeRepo({ files: { "a.txt": "a\n" } }), { commands: [] });
+  trust(repo, env.KRITES_CONFIG_DIR);
   await runCli(["off"], { env });
 
   assert.strictEqual(told(await runHook(SESSION, start(repo), { cwd: repo, env })), `${NOTE}\n${NO_CHECKS}`);
@@ -144,7 +146,7 @@ test("power: the session start says Krites is off first, and still records the b
 
 test("power: /krites:receipt signs nothing while off, /krites:verify says it is off, and on again the run is signed", async () => {
   const env = world();
-  const repo = changed("console.log('fine')");
+  const repo = changed("console.log('fine')", env);
   assert.deepStrictEqual(await runHook(GATE, stop(repo), { cwd: repo, env }), SILENT, "a passing gate, recorded before the switch");
   await runCli(["off"], { env });
 
